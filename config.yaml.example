@@ -1,0 +1,119 @@
+# 大雄看点映 — 东京电影简报配置文件
+# ============================================================
+# 复制此文件为 config.yaml 并按需修改
+# ============================================================
+
+# ── 影院配置 ────────────────────────────────────────────────
+theaters:
+
+  # TOHOシネマズ（东宝连锁影院）
+  toho:
+    enabled: true
+    base_url: "https://hlo.tohotheater.jp"
+    # 东京都内主要 TOHO 影院列表
+    locations:
+      - id: "076"
+        name: "TOHOシネマズ 日比谷"
+      - id: "036"
+        name: "TOHOシネマズ 新宿"
+      - id: "013"
+        name: "TOHOシネマズ 渋谷"
+      - id: "014"
+        name: "TOHOシネマズ 六本木ヒルズ"
+      - id: "043"
+        name: "TOHOシネマズ 池袋"
+      - id: "024"
+        name: "TOHOシネマズ 上野"
+
+  # ユナイテッド・シネマ（United Cinemas 连锁）
+  united:
+    enabled: true
+    base_url: "https://www.unitedcinemas.jp"
+    locations:
+      - id: "toyosu"
+        name: "ユナイテッド・シネマ 豊洲"
+      - id: "urawamisono"
+        name: "ユナイテッド・シネマ 浦和美園"
+
+  # 独立/艺术影院（可自行增删）
+  independent:
+    enabled: true
+    locations:
+      - name: "Uplink 吉祥寺"
+        url: "https://jk.uplink.co.jp"
+        schedule_path: "/schedule/"
+      - name: "シアター・イメージフォーラム"
+        url: "https://www.imageforum.co.jp"
+        schedule_path: "/theatre/now_showing.html"
+      - name: "シネマヴェーラ渋谷"
+        url: "https://www.cinemavera.com"
+        schedule_path: "/"
+      - name: "ポレポレ東中野"
+        url: "https://pole2.co.jp"
+        schedule_path: "/"
+      - name: "ケイズシネマ"
+        url: "https://www.ks-cinema.com"
+        schedule_path: "/"
+      - name: "早稲田松竹"
+        url: "https://wasedashochiku.co.jp"
+        schedule_path: "/"
+
+# ── 豆瓣配置 ─────────────────────────────────────────────────
+douban:
+  # 豆瓣搜索基础 URL（无需 API key，使用网页爬取）
+  search_url: "https://movie.douban.com/j/subject_suggest"
+  movie_base_url: "https://movie.douban.com/subject"
+  # 请求间隔（秒），避免被封
+  request_delay: 1.5
+  # 最低评分门槛（低于此分数的电影不纳入推荐）
+  min_score_threshold: 0.0
+  # 每部电影抓取的短评数量
+  short_review_count: 5
+
+# ── 评分权重（推荐度算法） ───────────────────────────────────
+ranking:
+  # 豆瓣评分（满分10分）→ 权重
+  douban_score_weight: 0.5
+  # 豆瓣评价人数（对数归一化）→ 权重
+  douban_votes_weight: 0.2
+  # 本周放映场次数 → 权重
+  screening_count_weight: 0.2
+  # 是否为本周新上映 → 权重
+  new_release_weight: 0.1
+
+# ── 简报生成配置 ─────────────────────────────────────────────
+generator:
+  # 输出目录
+  output_dir: "output"
+  # 简报标题模板（支持 {week_start} {week_end} {issue_number} 占位符）
+  title_template: "大雄看点映 第{issue_number}期｜{week_start} ~ {week_end}"
+  # 副标题
+  subtitle: "东京华人电影周报"
+  # 推荐榜显示数量
+  top_n: 10
+  # 是否包含下周预告
+  include_next_week: true
+  # 每部电影的短评显示条数
+  reviews_to_show: 3
+
+# ── 微信公众号配置 ────────────────────────────────────────────
+wechat:
+  # 填写你的公众号 AppID 和 AppSecret
+  app_id: "YOUR_WECHAT_APP_ID"
+  app_secret: "YOUR_WECHAT_APP_SECRET"
+  # Token 缓存文件（自动生成，无需手动填写）
+  token_cache_file: ".wechat_token_cache.json"
+  # 草稿作者
+  author: "大雄看点映"
+  # 封面图片 media_id（上传到公众号素材库后填入）
+  default_thumb_media_id: ""
+
+# ── Flask 应用配置 ────────────────────────────────────────────
+app:
+  host: "127.0.0.1"
+  port: 5000
+  debug: false
+  # 审核界面密码（留空则不需要密码）
+  password: ""
+  # Flask session 密钥（不填则每次重启会使 session 失效）
+  secret_key: ""

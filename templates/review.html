@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>审核简报 — {{ filename }}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; background: #f5f5f5; color: #333; }
+    header { background: #e8ac48; color: #fff; padding: 16px 40px; display: flex; align-items: center; justify-content: space-between; }
+    header h1 { font-size: 1.2rem; }
+    header .nav-links a { color: #fff; text-decoration: none; margin-left: 16px; font-size: 0.9rem; opacity: 0.85; }
+    header .nav-links a:hover { opacity: 1; }
+    .flash-messages { max-width: 1200px; margin: 16px auto 0; padding: 0 20px; }
+    .flash { padding: 10px 16px; border-radius: 6px; margin-bottom: 8px; font-size: 0.9rem; }
+    .flash.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .flash.error   { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    .flash.info    { background: #cce5ff; color: #004085; border: 1px solid #b8daff; }
+    .workspace { display: flex; height: calc(100vh - 60px); overflow: hidden; }
+    .editor-pane { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #ddd; }
+    .preview-pane { flex: 1; overflow-y: auto; background: #fff; padding: 30px 40px; }
+    .toolbar { background: #fff; border-bottom: 1px solid #eee; padding: 10px 16px; display: flex; align-items: center; gap: 12px; }
+    .toolbar span { font-size: 0.85rem; color: #666; flex: 1; }
+    textarea { flex: 1; width: 100%; border: none; outline: none; padding: 20px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; line-height: 1.7; resize: none; background: #fafafa; }
+    .btn { display: inline-block; padding: 7px 18px; border-radius: 6px; font-size: 0.88rem; cursor: pointer; text-decoration: none; border: none; transition: opacity .15s; }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: #e8ac48; color: #fff; }
+    .btn-secondary { background: #6c757d; color: #fff; }
+    .btn-publish { background: #28a745; color: #fff; }
+    /* Preview typography */
+    .preview-pane h1 { font-size: 1.6rem; margin-bottom: 12px; }
+    .preview-pane h2 { font-size: 1.25rem; margin: 24px 0 10px; border-left: 4px solid #e8ac48; padding-left: 10px; }
+    .preview-pane h3 { font-size: 1.05rem; margin: 18px 0 8px; }
+    .preview-pane p  { line-height: 1.8; margin-bottom: 8px; }
+    .preview-pane blockquote { border-left: 3px solid #e8ac48; padding-left: 14px; color: #666; margin: 10px 0; }
+    .preview-pane table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.9rem; }
+    .preview-pane table th, .preview-pane table td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    .preview-pane table th { background: #f5f5f5; }
+    .preview-pane hr { border: none; border-top: 1px solid #eee; margin: 24px 0; }
+    .preview-pane code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>📝 审核简报: {{ filename }}</h1>
+  <div class="nav-links">
+    <a href="{{ url_for('index') }}">← 返回列表</a>
+    <a href="{{ url_for('publish', filename=filename) }}">🚀 发布</a>
+  </div>
+</header>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+  <div class="flash-messages">
+    {% for category, message in messages %}
+      <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+{% endwith %}
+
+<div class="workspace">
+  <!-- Editor -->
+  <form class="editor-pane" method="post" action="{{ url_for('save', filename=filename) }}">
+    <div class="toolbar">
+      <span>✏️ Markdown 编辑器</span>
+      <button type="submit" class="btn btn-primary">💾 保存</button>
+      <a href="{{ url_for('publish', filename=filename) }}" class="btn btn-publish">🚀 发布</a>
+    </div>
+    <textarea name="content" id="editor" oninput="updatePreview()">{{ content }}</textarea>
+  </form>
+
+  <!-- Preview -->
+  <div class="preview-pane" id="preview">
+    {{ preview_html | safe }}
+  </div>
+</div>
+
+<script>
+  let debounceTimer;
+  function updatePreview() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const content = document.getElementById('editor').value;
+      fetch('{{ url_for("preview_html") }}', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({content})
+      })
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('preview').innerHTML = data.html;
+      });
+    }, 400);
+  }
+</script>
+</body>
+</html>
