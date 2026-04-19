@@ -66,15 +66,19 @@ def _safe_filename(filename: str) -> str:
     path-traversal attacks (e.g. '../../etc/passwd').
     Raises ValueError for invalid filenames.
     """
-    # Allow only: briefing_NNN_YYYY-MM-DD.md (and nothing else)
-    if not re.fullmatch(r"briefing_\d+_\d{4}-\d{2}-\d{2}\.md", filename):
-        raise ValueError(f"Invalid briefing filename: {filename!r}")
+    # Allow: briefing_NNN_YYYY-MM-DD.md, step1_YYYY-MM-DD.md, step2_YYYY-MM-DD.md, step3_YYYY-MM-DD.md
+    if not re.fullmatch(r"(briefing_\d+_\d{4}-\d{2}-\d{2}|step\d+_\d{4}-\d{2}-\d{2})\.md", filename):
+        raise ValueError(f"Invalid filename: {filename!r}")
     return filename
 
 
 def list_briefings() -> list[dict]:
-    """List all generated briefing files, newest first."""
-    files = sorted(OUTPUT_DIR.glob("briefing_*.md"), reverse=True)
+    """List all generated briefing/step files, newest first."""
+    files = sorted(
+        list(OUTPUT_DIR.glob("briefing_*.md")) + list(OUTPUT_DIR.glob("step*_*.md")),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
     result = []
     for f in files:
         stat = f.stat()
