@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run_scraper.py — 大雄看点映 自动抓取脚本
+"""run_scraper.py — 大熊看点映 自动抓取脚本
 
 用法:
   python run_scraper.py                   # 抓取本周电影，生成 Markdown 简报
@@ -7,6 +7,7 @@
   python run_scraper.py --no-douban       # 跳过豆瓣评分抓取
   python run_scraper.py --output FILE     # 指定输出文件路径
   python run_scraper.py --issue N         # 手动指定期号
+  python run_scraper.py --resume          # Cookie 更新后继续上次中断的抓取
 """
 from __future__ import annotations
 
@@ -24,12 +25,17 @@ import yaml
 # Ensure repo root is on sys.path regardless of how the script is invoked
 sys.path.insert(0, str(Path(__file__).parent))
 
-from scraper.toho import scrape_all_toho
-from scraper.united import scrape_all_united
-from scraper.independent import scrape_all_independent
-from scraper.douban import enrich_all_movies
-from scraper.base import TheaterSchedule
-from generator.briefing import generate_briefing, merge_schedules
+# Ensure stdout can handle CJK characters on Windows (cp932 terminals)
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from scraper.base import TheaterSchedule, MovieInfo, ScreeningInfo
+from generator.briefing import generate_wechat_briefing_md
+from pipeline.step1_eiga import register_theaters, scrape_movies
+from pipeline.step2_douban import enrich_for_briefing
 
 logging.basicConfig(
     level=logging.INFO,
@@ -243,22 +249,82 @@ def _issue_number(output_dir: Path) -> int:
     return (max(nums) + 1) if nums else 1
 
 
+# ── DB fallback helpers ───────────────────────────────────────────────────────
+
+def _load_movies_from_db() -> list[MovieInfo]:
+    """Load chain/indie movies from DB when step1 skip path returns empty."""
+    import sqlite3
+    db = Path("data/eiga.db")
+    if not db.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM movies WHERE category IN ('chain','indie') ORDER BY category, rank"
+        ).fetchall()
+        conn.close()
+        movies = []
+        for r in rows:
+            mi = MovieInfo(
+                title_jp=r["title_jp"] or "",
+                title_original=r["title_original"] or "",
+                country=r["country"] or "",
+                director=r["director"] or "",
+                year=r["year"] or 0,
+                duration=r["duration"] or 0,
+            )
+            movies.append(mi)
+        return movies
+    except Exception as exc:
+        logger.warning("Failed to load movies from DB: %s", exc)
+        return []
+
+
+def _apply_step2_results(movies: list[MovieInfo], results: dict) -> None:
+    """Populate douban fields in MovieInfo objects from step2 match results."""
+    by_title: dict[str, dict] = {}
+    for cat_movies in results.values():
+        for m in cat_movies:
+            if m.get("title_jp") and m.get("douban_id"):
+                by_title[m["title_jp"]] = m
+    for mi in movies:
+        m = by_title.get(mi.title_jp)
+        if not m:
+            continue
+        mi.title_cn = m.get("title_cn") or ""
+        mi.douban_id = str(m.get("douban_id") or "")
+        mi.douban_url = m.get("douban_url") or (
+            f"https://movie.douban.com/subject/{m['douban_id']}/" if m.get("douban_id") else ""
+        )
+        try:
+            mi.douban_score = float(m.get("douban_score") or 0)
+        except (TypeError, ValueError):
+            mi.douban_score = 0.0
+        try:
+            mi.douban_votes = int(m.get("douban_votes") or 0)
+        except (TypeError, ValueError):
+            mi.douban_votes = 0
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="大雄看点映 — 电影简报自动抓取")
+    parser = argparse.ArgumentParser(description="大熊看点映 — 电影简报自动抓取")
     parser.add_argument("--demo", action="store_true",
                         help="使用演示数据，不发起真实网络请求")
     parser.add_argument("--no-douban", action="store_true",
                         help="跳过豆瓣评分抓取")
+    parser.add_argument("--no-scan", action="store_true",
+                        help="不进行网络扫描，只从本地 DB 生成 MD（快速预览）")
     parser.add_argument("--output", default="",
                         help="输出文件路径（默认: output/briefing_N_YYYY-MM-DD.md）")
     parser.add_argument("--issue", type=int, default=0,
                         help="手动指定期号（默认: 自动检测）")
     parser.add_argument("--config", default="config.yaml",
                         help="配置文件路径")
-    parser.add_argument("--json", action="store_true",
-                        help="同时保存结构化 JSON 数据")
+    parser.add_argument("--resume", action="store_true",
+                        help="从上次中断处继续豆瓣抓取（Cookie 更新后使用）")
     args = parser.parse_args()
 
     config = _load_config(args.config)
@@ -270,91 +336,85 @@ def main() -> None:
     today = date.today()
 
     # ── Scrape ───────────────────────────────────────────────────────────────
+    if args.no_scan:
+        # Run quick MD generation from local DB without scraping
+        logger.info("--no-scan: 直接从本地 DB 生成 MD（不抓取）")
+        # Use the helper script to generate step1/step2/step3
+        try:
+            import subprocess, sys
+            subprocess.run([sys.executable, "scripts/generate_md_no_scan.py"], check=True)
+        except Exception as exc:
+            logger.error("生成 MD 失败: %s", exc)
+        return
+
     if args.demo:
         logger.info("=== 演示模式：使用本地演示数据 ===")
         schedules = _load_demo_data()
     else:
-        schedules: list[TheaterSchedule] = []
-        theaters_cfg = config.get("theaters", {})
+        # Use eiga.com pipeline only: register theaters and scrape now-showing movies
+        theaters = register_theaters(delay=0.3)
+        results = scrape_movies(delay=0.3)
 
-        if theaters_cfg.get("toho", {}).get("enabled"):
-            logger.info("正在抓取 TOHO 影院排期...")
-            schedules.extend(scrape_all_toho(theaters_cfg["toho"]))
+        # Convert scraped results into MovieInfo list
+        all_movies: list[MovieInfo] = []
+        for cat in ("chain", "indie", "other"):
+            for m in results.get(cat, []):
+                mi = MovieInfo(
+                    title_jp=m.get("title_jp", ""),
+                    title_original=m.get("title_original", "") or "",
+                    country=m.get("country", "") or "",
+                    director=m.get("director", "") or "",
+                    year=m.get("year") or 0,
+                    duration=m.get("duration") or 0,
+                )
+                # screenings may be absent; keep theater names if present
+                for tn in m.get("_theater_names", []) if isinstance(m.get("_theater_names"), list) else []:
+                    mi.add_screening(ScreeningInfo(theater_name=tn))
+                all_movies.append(mi)
 
-        if theaters_cfg.get("united", {}).get("enabled"):
-            logger.info("正在抓取 United Cinemas 排期...")
-            schedules.extend(scrape_all_united(theaters_cfg["united"]))
+        # Step1 skip path may return empty if today's snapshot is missing.
+        # Fall back to loading all movies from the DB directly.
+        if not all_movies:
+            logger.info("Step1 returned empty results; loading movies from DB directly")
+            all_movies = _load_movies_from_db()
 
-        if theaters_cfg.get("independent", {}).get("enabled"):
-            logger.info("正在抓取独立影院排期...")
-            schedules.extend(scrape_all_independent(theaters_cfg["independent"]))
+        # Run step2 unconditionally — it reads the DB directly and is independent
+        # of whether step1 scraped or skipped.
+        step2_results = None
+        if not args.no_douban:
+            from pipeline.step2_douban import match_movies, generate_step2_md
+            step2_results = match_movies(categories=("chain", "indie"), delay=5.0, resume=True)
+            generate_step2_md(step2_results)
 
-        if not schedules:
+        if not all_movies:
             logger.warning("未抓取到任何排期数据。使用演示数据代替。")
             schedules = _load_demo_data()
-
-        # ── Enrich with Douban ────────────────────────────────────────────
-        if not args.no_douban:
-            all_movies = merge_schedules(schedules)
-            logger.info("正在从豆瓣获取评分数据（共 %d 部电影）...", len(all_movies))
-            enrich_all_movies(all_movies, config.get("douban", {}))
-            # Replace schedules with a single merged-and-enriched schedule
+        else:
+            if step2_results:
+                _apply_step2_results(all_movies, step2_results)
+            # Compute screening period for each movie
+            for movie in all_movies:
+                movie.compute_screening_period()
             merged = TheaterSchedule(source="merged", theater_name="all")
             merged.movies = all_movies
             schedules = [merged]
 
     # ── Generate ─────────────────────────────────────────────────────────────
-    logger.info("正在生成简报 Markdown...")
-    md_content, ranked_movies = generate_briefing(
-        schedules=schedules,
-        config=config,
-        issue_number=issue_number,
-    )
+    # WeChat 公众号 briefing: 院線映画 + 小众映画 (top 5 each, douban_score > 0).
+    # Enrich first so douban_details has director/cast/genre/want/watched/reviews
+    # with reviewer IDs, then render the final MD.
+    logger.info("正在抽取豆瓣详细信息 (top 5 院线 + top 5 小众)...")
+    enrich_for_briefing(top_n=5, delay=2.0)
 
-    # ── Save ─────────────────────────────────────────────────────────────────
+    logger.info("正在生成简报 Markdown...")
     if args.output:
         out_path = Path(args.output)
     else:
         out_path = output_dir / f"briefing_{issue_number:03d}_{today.isoformat()}.md"
+    generate_wechat_briefing_md(top_n=5, output_path=out_path)
 
-    out_path.write_text(md_content, encoding="utf-8")
     logger.info("简报已保存: %s", out_path)
-    print(f"\n✅  简报已生成: {out_path}\n")
-
-    # Optional JSON dump
-    if args.json:
-        json_path = out_path.with_suffix(".json")
-        data = []
-        for m in ranked_movies:
-            data.append({
-                "title_jp": m.title_jp,
-                "title_cn": m.title_cn,
-                "director": m.director,
-                "cast": m.cast,
-                "year": m.year,
-                "genre": m.genre,
-                "duration": m.duration,
-                "douban_score": m.douban_score,
-                "douban_votes": m.douban_votes,
-                "douban_url": m.douban_url,
-                "recommendation_score": m.recommendation_score,
-                "screening_count": m.screening_count,
-                "is_new_release": m.is_new_release,
-                "theaters": list({s.theater_name for s in m.screenings}),
-                "short_reviews": m.douban_short_reviews,
-            })
-        json_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        logger.info("JSON 数据已保存: %s", json_path)
-        print(f"📊  JSON 数据: {json_path}\n")
-
-    print(f"📽️  本期共收录 {len(ranked_movies)} 部电影")
-    print("🏆  推荐榜 Top 5:")
-    for i, m in enumerate(ranked_movies[:5], 1):
-        title = m.title_cn or m.title_jp
-        score_str = f"豆瓣 {m.douban_score}" if m.douban_score else "暂无豆瓣评分"
-        print(f"   {i}. {title} — {score_str}，推荐指数 {m.recommendation_score:.0f}/100")
+    print(f"\n[OK] 简报已生成: {out_path}\n")
 
 
 if __name__ == "__main__":

@@ -1,172 +1,110 @@
-# 🎬 大雄看点映 — 东京华人电影周报
+# 🎬 大熊看点映 — 东京华人映画周报
 
-> 面向东京华人社区的微信公众号自动化工具，每周自动抓取 TOHO、United 等主流连锁影院及独立艺术影院的排期，匹配豆瓣评分与短评，自动生成推荐度排行榜，并支持一键审核发布到微信公众号。
+本项目以 eiga.com 为数据源（Step1）抓取东京上映电影，并在 Step2 将电影与豆瓣匹配以获取中文名、评分与短评，最终生成 Markdown 简报供人工审核与发布。
 
----
+核心设计（精要）
 
-## ✨ 功能概览
+- Step1（pipeline/step1_eiga.py）
+  - 仅使用 eiga.com 抓取：登记东京影院（theaters）并抓取正在上映的电影（movies、screenings）。
+  - 分类与快照：master movies 表在首次遇见电影时写入主记录；每次抓排行会向 movie_snapshots 写入当天的排名快照（snapshot_date, rank, movie_id），Step1 输出基于该快照生成 MD。小众/院线的判定规则见下文。
+  - 记录 run_state.last_run_date（以日本时区 JST），当天已成功抓取则跳过当日重复抓取。
+  - 数据库存于 data/eiga.db（SQLite），包含 tables: theaters, movies, screenings, movie_snapshots, run_state。
 
-| 模块 | 功能 |
-|------|------|
-| **Part 1：自动抓取** | 抓取 TOHO、United Cinemas、独立影院的本周 / 下周排期 |
-| | 从豆瓣获取中文片名、评分、评价人数、精选短评 |
-| | 综合豆瓣评分 + 评价人数 + 放映场次 + 新片加成，自动计算推荐指数 |
-| | 输出结构化 Markdown 简报 + JSON 数据文件 |
-| **Part 2：审核发布** | Flask 本地 Web 界面，支持在线编辑预览 |
-| | 一键将简报发布为微信公众号草稿或直接发布 |
+- Step2（pipeline/step2_douban.py）
+  - 在 Douban 上匹配电影并抓取评分/短评，结果写入 douban_matches，并保存历史快照到 douban_matches_history。
+  - 支持断点/恢复：默认 resume 模式会跳过已匹配并 verified 的条目；可通过参数只重跑未匹配条目。
+  - 支持跳过名单（douban_skip_list）：把找不到豆瓣的演唱会等加入跳过名单，后续 Step2 自动跳过。
 
----
+可用脚本/接口（快速参考）
 
-## 🗂️ 项目结构
+- Step1
+  - python run_step1.py
+    - 登记并抓取最新上映电影（会检查 run_state.last_run_date，若当天已抓取则跳过）。
+  - 强制重跑（清除 last_run_date）:
+    - sqlite3 data/eiga.db "DELETE FROM run_state WHERE key='last_run_date';"
+  - 产出文件说明：
+    - 输出的 Markdown: output/step1_YYYY-MM-DD.md
+    - 额外会写入 output/step1_run_state.json，包含 last_run_jst（日本时区的 ISO 时间）和生成的 MD 路径，便于快速确认 Step1 的最后成功执行时间。
 
-```
-daxiongwatchmovies/
-├── run_scraper.py          # Part 1：抓取脚本（CLI）
-├── app.py                  # Part 2：Flask 审核发布界面
-├── config.yaml.example     # 配置文件模板
-├── requirements.txt
-│
-├── scraper/
-│   ├── base.py             # 数据类（MovieInfo, ScreeningInfo, TheaterSchedule）
-│   ├── toho.py             # TOHOシネマズ 排期抓取
-│   ├── united.py           # ユナイテッド・シネマ 排期抓取
-│   ├── independent.py      # 独立影院通用抓取（可配置）
-│   └── douban.py           # 豆瓣评分 / 短评获取
-│
-├── generator/
-│   └── briefing.py         # Markdown 简报生成 + 推荐度算法
-│
-├── publisher/
-│   └── wechat.py           # 微信公众号 API（草稿 / 发布）
-│
-├── templates/              # Flask HTML 模板
-│   ├── index.html          # 简报列表页
-│   ├── review.html         # 审核编辑页（左编辑器 / 右实时预览）
-│   └── publish.html        # 发布配置页
-│
-├── output/                 # 自动生成的简报文件（.md / .json）
-└── tests/                  # 单元测试
-    ├── test_briefing.py
-    └── test_wechat.py
-```
+- Step2
+  - python step2_api.py run [--no-md] [--delay N]
+    - 已匹配（verified=1）的条目静默跳过，不产生 log、不发请求。
+    - 搜索失败过的电影自动加入 douban_skip_list，后续 run 静默跳过，等待手动匹配。
+    - --no-md：不生成 MD 报告文件。
+  - 产出文件说明：
+    - 输出的 Markdown: output/step2_YYYY-MM-DD.md
+    - Step2 生成的 MD 在末尾会追加”未匹配”表格，列出所有没有 douban_id 的电影（便于人工核对）。
 
----
+CSV 脚本（scripts/douban_csv.py）：
 
-## 🚀 快速开始
+# 导出
+python scripts/douban_csv.py export
+python scripts/douban_csv.py export output/my_export.csv
 
-### 1. 安装依赖
+# 导入（修改 CSV 里的 douban_url 后）
+python scripts/douban_csv.py import douban_export.csv
+导出列：movie_id / category / rank / title_jp / title_original / year / country / douban_id / title_cn / douban_url / douban_score / douban_votes / verified / search_attempts / in_skip_list / skip_reason
 
-```bash
-pip install -r requirements.txt
-```
+导入规则：
+douban_url 有值 → upsert 进 douban_matches（verified=1, search_attempts=0），同时从 skip list 移除
+douban_url 为空 → 删除该电影的 match 记录，下次 step2 会重新搜索
 
-### 2. 配置
 
-```bash
-cp config.yaml.example config.yaml
-# 编辑 config.yaml，填入微信公众号 AppID / AppSecret
-# 可自定义独立影院列表（theaters.independent.locations）
-```
 
-### 3. Part 1：生成简报
+- Step2 手动匹配
+  - python step2_api.py manual-set <movie_id> <douban_id> [--delay N]
+    - 当自动搜索找不到结果时，在豆瓣网站手动找到对应页面，将 URL 中的数字 ID 填入。
+    - 示例：豆瓣页面 https://movie.douban.com/subject/36608656/ 则 douban_id 为 36608656。
+    - 执行后会拉取该豆瓣页面，解析评分/导演/演员/年份/国家/短评等，写入 douban_matches（verified=1）和 douban_details。
+    - 手动匹配的电影在后续 step2 run 中会被静默跳过（不会覆盖）。
+    - 示例：
+      - python step2_api.py manual-set eiga_12345 36608656
 
-```bash
-# 演示模式（不发起真实网络请求，使用内置示例数据）
-python run_scraper.py --demo
+- Step2 跳过名单管理
+  - python step2_api.py skip add <movie_id> [--reason <reason>]
+    - 将 movie_id 加入 douban_skip_list，Step2 以后静默跳过（适用于演唱会、活动等非电影条目）。
+  - python step2_api.py skip remove <movie_id>
+    - 从跳过名单中移除，恢复自动匹配。
+  - python step2_api.py skip list
+    - 列出所有跳过条目。
 
-# 生产模式（抓取真实排期 + 豆瓣评分）
-python run_scraper.py
+数据库表要点
 
-# 跳过豆瓣抓取（速度更快）
-python run_scraper.py --no-douban
+- run_state: 用于记录 last_run_date（JST ISO 日期）。
+- douban_matches: movie_id -> douban_id / score / votes / verified / matched_at / search_attempts。
+  - verified=1 表示匹配成功（自动或手动），Step2 不会再搜索。
+  - search_attempts 记录自动搜索失败次数，达到 3 次后 Step2 静默跳过；--rerun-unmatched 可重置。
+- douban_matches_history: 每次抓取的评分快照。
+- douban_details: 手动匹配或 enrich_top_movies 后写入的完整页面数据（导演/演员/短评/预告片等）。
+- douban_skip_list: 永久跳过名单（reason, noted_at），仅影响 Step2 自动搜索，不影响 Step3。
 
-# 同时输出 JSON 结构化数据
-python run_scraper.py --demo --json
+影院分类规则
 
-# 查看所有选项
-python run_scraper.py --help
-```
+- 新的判定原则（已应用于 pipeline/step1_eiga.py）：
+  - 若某电影在东京上映的任一电影院属于“院线影院”（theaters 表中 chain 字段非空），则该电影被归为「院线 (chain)」。
+  - 若该电影在东京有上映影院，但所有上映影院都不属于院线（chain 字段为空），则归为「小众 (indie)」。
+  - 若在东京找不到任何上映影院，则归为「其他 (other)」。
 
-生成的简报保存在 `output/briefing_001_2026-04-13.md`，格式示例：
+- 说明与影响：
+  - 该规则不再依赖地理区域关键字（以前基于地区关键词判断的小众逻辑已废弃）。
+  - Step1 在生成 MD 时会展示该电影的所有已知上映影院（不再受地区限制），避免出现“电影没有写上映影院”的遗漏情况。
+  - movie_snapshots 保存的是按排名的快照：snapshot_date, rank, movie_id（movie_id 对应 master movies 表的主键）。Step1 的 MD 输出基于该快照和 master 表的元数据（片名/原题/年份/国家）生成。
 
-```
-# 大雄看点映 第1期｜4月13日 ~ 4月19日
-> 东京华人电影周报
 
-## 📅 本周上映（4月13日 ～ 4月19日）
-### ◆. 利益区域（関心領域）
-| 项目 | 内容 |
-| 🌐 豆瓣 | ★★★★　 8.3 |
-| 📍 上映影院 | シアター・イメージフォーラム |
-> 💬 用反高潮的方式呈现高潮——这才是最令人不安的恐怖。
+工作流建议
 
-## 🏆 本周推荐榜 Top 10
-| 🥇 | 利益区域 | 70/100 | 8.3 | ... |
-...
-```
+1. 每天运行 run_step1.py（或由调度器触发）。Step1 会在当天第一次成功运行后记录 last_run_date，避免重复抓取同日数据。
+2. 运行 step2_api.py 在 douban 上补全/刷新评分。建议默认不频繁强制重抓已有评分的条目。
+3. 对于明确不是电影（演唱会、活动）或在豆瓣上找不到条目的记录，使用 add_movie_to_skip_list 标注为跳过。
 
-### 4. Part 2：审核发布
+运维与安全注意
 
-```bash
-python app.py
-# 打开浏览器访问 http://127.0.0.1:5000
-```
+- 请勿将含敏感 Cookie 的文件（如 _douban_cookies.json）保存在代码仓库中。推荐使用 Playwright 的持久化 profile（.playwright_profile）来保存登录态，或在本地 config 中设置 cookie 字符串（谨慎）。
+- 若需手动操作 DB，请在脚本停止状态下使用 sqlite3 CLI 执行修改，避免并发写入冲突。
 
-界面功能：
-- **简报列表**：查看所有已生成的简报文件
-- **审核 / 编辑**：左侧 Markdown 编辑器 + 右侧实时预览
-- **发布**：选择「仅创建草稿」或「直接发布」，一键推送到微信公众号
+项目特定说明（来自 .github/copilot-instructions.md）
 
----
-
-## ⚙️ 推荐度算法
-
-推荐指数（0-100分）由以下四个维度加权计算：
-
-| 维度 | 权重 | 说明 |
-|------|------|------|
-| 豆瓣评分 | 50% | 满分10分，线性映射 |
-| 豆瓣评价人数 | 20% | log₁₀归一化（1000万人→满分）|
-| 本周放映场次 | 20% | 上限20场，越多越高 |
-| 本周新上映 | 10% | 新片额外加成 |
-
-权重可在 `config.yaml` 的 `ranking` 节中自定义。
-
----
-
-## 🏪 影院配置
-
-### 连锁影院
-`config.yaml` 中已预配置东京主要 TOHO 和 United Cinemas 影院。可按需增删。
-
-### 独立影院
-在 `config.yaml` 的 `theaters.independent.locations` 中添加：
-
-```yaml
-- name: "新影院名称"
-  url: "https://theater-website.jp"
-  schedule_path: "/schedule/"
-```
-
-抓取器会自动适配常见的日本影院网页结构。
-
----
-
-## 🧪 运行测试
-
-```bash
-python -m pytest tests/ -v
-```
-
----
-
-## 📋 常见问题
-
-**Q: 豆瓣抓取很慢或被封？**  
-A: 增大 `config.yaml` 中的 `douban.request_delay`（默认 1.5 秒）。
-
-**Q: 微信发布报错 40001？**  
-A: AppID / AppSecret 填写有误，或公众号未认证。
-
-**Q: 独立影院没有抓取到数据？**  
-A: 该影院可能使用了 JavaScript 动态渲染。可手动将排期粘贴到 `output/briefing_xxx.md` 后再审核发布。
+- 请不要使用空白或临时 profile。
+- 由于 VS 终端粘贴时可能会逐字符导致长命令被破坏，请优先将复杂命令写入脚本（.py 或 .ps1），再通过短命令执行，例如：
+  - python _script.py
+  - powershell ./_script.ps1

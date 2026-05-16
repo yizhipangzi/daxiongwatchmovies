@@ -24,8 +24,15 @@ def client(tmp_path):
 
 
 class TestSafeFilename:
-    def test_valid_filename(self):
+    def test_valid_filename_with_issue(self):
         assert _safe_filename("briefing_001_2026-04-13.md") == "briefing_001_2026-04-13.md"
+
+    def test_valid_filename_no_issue(self):
+        # New WeChat briefing filename (no issue number)
+        assert _safe_filename("briefing_2026-05-12.md") == "briefing_2026-05-12.md"
+
+    def test_valid_step_filename(self):
+        assert _safe_filename("step2_2026-05-12.md") == "step2_2026-05-12.md"
 
     def test_path_traversal_rejected(self):
         with pytest.raises(ValueError):
@@ -48,7 +55,7 @@ class TestIndexRoute:
     def test_index_200(self, client):
         resp = client.get("/")
         assert resp.status_code == 200
-        assert "大雄看点映" in resp.data.decode()
+        assert "大熊看点映" in resp.data.decode()
 
     def test_index_shows_briefings(self, client, tmp_path):
         (tmp_path / "briefing_001_2026-04-13.md").write_text("# Test", encoding="utf-8")

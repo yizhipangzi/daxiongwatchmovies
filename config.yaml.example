@@ -1,4 +1,4 @@
-# 大雄看点映 — 东京电影简报配置文件
+# 大熊看点映 — 东京电影简报配置文件
 # ============================================================
 # 复制此文件为 config.yaml 并按需修改
 # ============================================================
@@ -58,6 +58,18 @@ theaters:
         url: "https://wasedashochiku.co.jp"
         schedule_path: "/"
 
+  # Grand Cinema Sunshine 连锁影院
+  grandcinema:
+    enabled: true
+    base_url: "https://www.cinemasunshine.co.jp"
+    locations:
+      - id: "gdcs"
+        name: "グランドシネマサンシャイン 池袋"
+      - id: "ikebukuro"
+        name: "シネマサンシャイン 池袋"
+      - id: "heiwajima"
+        name: "シネマサンシャイン 平和島"
+
 # ── 豆瓣配置 ─────────────────────────────────────────────────
 douban:
   # 豆瓣搜索基础 URL（无需 API key，使用网页爬取）
@@ -69,24 +81,34 @@ douban:
   min_score_threshold: 0.0
   # 每部电影抓取的短评数量
   short_review_count: 5
+  # ── 反爬配置（参考 GitHub 开源豆瓣爬虫最佳实践） ──
+  # 浏览器登录豆瓣后复制 Cookie 贴到此处（大幅降低被 403 的概率）
+  # 获取方式：浏览器打开 movie.douban.com → F12 → Network → 刷新 → 点任意请求 → 复制 Request Headers 中的 Cookie
+  cookie: ""
+  # HTTP 代理（可选），格式如 http://127.0.0.1:7890
+  proxy: ""
 
 # ── 评分权重（推荐度算法） ───────────────────────────────────
 ranking:
   # 豆瓣评分（满分10分）→ 权重
-  douban_score_weight: 0.5
+  douban_score_weight: 0.35
   # 豆瓣评价人数（对数归一化）→ 权重
-  douban_votes_weight: 0.2
+  douban_votes_weight: 0.15
+  # 想看人数 → 权重
+  douban_want_weight: 0.10
+  # 看过人数 → 权重
+  douban_watched_weight: 0.10
   # 本周放映场次数 → 权重
-  screening_count_weight: 0.2
+  screening_count_weight: 0.20
   # 是否为本周新上映 → 权重
-  new_release_weight: 0.1
+  new_release_weight: 0.10
 
 # ── 简报生成配置 ─────────────────────────────────────────────
 generator:
   # 输出目录
   output_dir: "output"
   # 简报标题模板（支持 {week_start} {week_end} {issue_number} 占位符）
-  title_template: "大雄看点映 第{issue_number}期｜{week_start} ~ {week_end}"
+  title_template: "大熊看点映 第{issue_number}期｜{week_start} ~ {week_end}"
   # 副标题
   subtitle: "东京华人电影周报"
   # 推荐榜显示数量
@@ -104,7 +126,7 @@ wechat:
   # Token 缓存文件（自动生成，无需手动填写）
   token_cache_file: ".wechat_token_cache.json"
   # 草稿作者
-  author: "大雄看点映"
+  author: "大熊看点映"
   # 封面图片 media_id（上传到公众号素材库后填入）
   default_thumb_media_id: ""
 

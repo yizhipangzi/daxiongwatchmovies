@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from publisher.wechat import WeChatPublisher
 
-SAMPLE_MD = """# 大雄看点映 第1期｜4月13日 ~ 4月19日
+SAMPLE_MD = """# 大熊看点映 第1期｜4月13日 ~ 4月19日
 
 ## 本周上映
 
@@ -53,7 +53,7 @@ class TestWeChatPublisher:
         return WeChatPublisher({
             "app_id": "test_app_id",
             "app_secret": "test_secret",
-            "author": "大雄看点映",
+            "author": "大熊看点映",
             "default_thumb_media_id": "",
             "token_cache_file": "/tmp/test_wechat_token.json",
         })

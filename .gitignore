@@ -44,12 +44,21 @@ htmlcov/
 
 # IDE
 .idea/
+.vs/
 .vscode/
 *.swp
 *.swo
+.github/
+.playwright_profile/
+.claude/
 
 # macOS
 .DS_Store
 
 # Logs
 *.log
+
+.wechat_token_cache.json
+config.yaml
+data/
+output/

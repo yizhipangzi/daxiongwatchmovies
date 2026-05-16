@@ -1,309 +1,424 @@
-"""Briefing markdown generator for 大雄看点映.
+"""WeChat 公众号 briefing markdown generator.
 
-Merges all scraped theater schedules, deduplicates movies, scores them,
-and renders a ready-to-publish Markdown document.
+Loads movie + douban data from data/eiga.db, applies the section filters
+defined in ``_SECTION_SPECS``, and renders a publication-ready Markdown
+file using the templates in ``briefing_template.py``.
+
+Public entry points:
+    generate_wechat_briefing_md(top_n, output_path)
+    select_briefing_movie_ids(top_n)
 """
 from __future__ import annotations
 
 import logging
-import math
-import os
 import re
-from datetime import date, timedelta
+import sqlite3
+from datetime import date
+from pathlib import Path
 from typing import Optional
-
-from scraper.base import MovieInfo, TheaterSchedule
 
 logger = logging.getLogger(__name__)
 
+# ── Template imports ────────────────────────────────────────────────────────
+#
+# All visible text / layout lives in ``briefing_template.py`` — edit that file
+# to change wording, emoji, section labels, ordering, etc. The code below only
+# loads data from SQLite and substitutes it into those templates.
 
-# ── Recommendation scoring ───────────────────────────────────────────────────
-
-def calculate_recommendation_score(movie: MovieInfo, weights: dict) -> float:
-    """Return a 0-100 recommendation score for a movie.
-
-    Factors:
-    - douban_score      (0-10 → scaled)
-    - douban_votes      (log-normalized)
-    - screening_count   (more showings = more popular / accessible)
-    - is_new_release    (bonus for freshness)
-    """
-    w_score = weights.get("douban_score_weight", 0.5)
-    w_votes = weights.get("douban_votes_weight", 0.2)
-    w_screens = weights.get("screening_count_weight", 0.2)
-    w_new = weights.get("new_release_weight", 0.1)
-
-    # Douban score component (0-10 → 0-100)
-    score_component = (movie.douban_score / 10.0) * 100 if movie.douban_score else 0.0
-
-    # Votes component: log₁₀(votes+1) normalised against 10,000,000 votes → 100
-    _LOG10_MAX_VOTES = 7.0  # log10(10_000_000) — 10M votes maps to a perfect score
-    votes_component = (math.log10(movie.douban_votes + 1) / _LOG10_MAX_VOTES) * 100 \
-        if movie.douban_votes else 0.0
-
-    # Screening frequency component (cap at 20 showings)
-    screens_component = min(movie.screening_count / 20.0, 1.0) * 100
-
-    # New release bonus
-    new_component = 100.0 if movie.is_new_release else 0.0
-
-    total = (
-        w_score * score_component
-        + w_votes * votes_component
-        + w_screens * screens_component
-        + w_new * new_component
-    )
-    return round(total, 2)
+from .briefing_template import (
+    DATE_FORMAT,
+    BRIEFING_HEADER,
+    SECTION_LABELS,
+    SECTION_HEADER,
+    SECTION_EMPTY_PLACEHOLDER,
+    MOVIE_BLOCK,
+    STATS_WITH_SCORE,
+    STATS_WITH_NEW_RATING,
+    STATS_NO_DATA,
+    REVIEW_LINE,
+    REVIEW_NONE,
+    REVIEW_ANONYMOUS,
+    THEATER_SEP,
+    NO_THEATERS,
+    EMPTY_FIELD,
+)
 
 
-# ── Deduplication ────────────────────────────────────────────────────────────
+def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str]) -> str:
+    """Render one movie block by filling in the MOVIE_BLOCK template."""
+    cn = (m.get("title_cn") or m.get("title_jp") or "").strip()
+    title_jp = (m.get("title_jp") or "").strip()
+    orig = (m.get("title_original") or "").strip()
+    douban_url = m.get("douban_url") or ""
 
-def _normalize_title(title: str) -> str:
-    """Normalize a Japanese title for deduplication."""
-    # Remove common suffixes like "(字幕版)" "(吹替版)"
-    title = re.sub(r"[（(][^）)]*[）)]", "", title)
-    # Collapse whitespace
-    return re.sub(r"\s+", "", title).lower()
-
-
-def merge_schedules(schedules: list[TheaterSchedule]) -> list[MovieInfo]:
-    """Merge all theater schedules into a deduplicated list of MovieInfo."""
-    seen: dict[str, MovieInfo] = {}
-    for sched in schedules:
-        for movie in sched.movies:
-            key = _normalize_title(movie.title_jp)
-            if key in seen:
-                # Merge screenings
-                seen[key].screenings.extend(movie.screenings)
-                seen[key].screening_count = len(seen[key].screenings)
-                # Keep richer data
-                if not seen[key].poster_url and movie.poster_url:
-                    seen[key].poster_url = movie.poster_url
-            else:
-                seen[key] = movie
-    return list(seen.values())
-
-
-# ── Markdown rendering ───────────────────────────────────────────────────────
-
-def _stars(score: float) -> str:
-    """Convert douban score to star string."""
-    if score == 0:
-        return "暂无评分"
-    full = int(score / 2)
-    half = 1 if (score / 2 - full) >= 0.5 else 0
-    empty = 5 - full - half
-    return "★" * full + "☆" * half + "　" * empty + f"  {score:.1f}"
-
-
-def _theater_list(movie: MovieInfo) -> str:
-    """Return a deduplicated, sorted list of theater names for a movie."""
-    names = sorted({s.theater_name for s in movie.screenings})
-    return "、".join(names)
-
-
-def _week_range(start: date) -> tuple[date, date]:
-    """Return (monday, sunday) of the ISO week containing `start`."""
-    monday = start - timedelta(days=start.weekday())
-    sunday = monday + timedelta(days=6)
-    return monday, sunday
-
-
-def _format_date_jp(d: date) -> str:
-    return f"{d.month}月{d.day}日"
-
-
-TEMPLATE = """\
-# {title}
-> {subtitle}
-
----
-
-## 📅 本周上映（{week_start} ～ {week_end}）
-
-{this_week_section}
-
----
-
-## 🏆 本周推荐榜 Top {top_n}
-
-{ranking_section}
-
----
-
-{next_week_section}\
-## 🎬 关于大雄看点映
-
-> 面向东京华人社区的每周电影情报，涵盖 TOHO、United 等主流连锁及独立艺术影院。  
-> 数据来源：各影院官网 + 豆瓣电影  
-> 如有疑问或投稿欢迎留言 🎞
-"""
-
-MOVIE_BLOCK = """\
-### {rank}. {display_title}
-
-| 项目 | 内容 |
-|------|------|
-| 🎬 原题 | {title_jp} |
-| 🌐 豆瓣 | [{douban_score_str}]({douban_url}) |
-| 👤 导演 | {director} |
-| 🎭 主演 | {cast} |
-| 🏷️ 类型 | {genre} |
-| 📍 上映影院 | {theaters} |
-
-{reviews_section}\
-"""
-
-RANKING_ROW = "| {rank} | {display_title} | {score_str} | {douban_score_str} | {theaters} |"
-
-
-def _movie_section(movies: list[MovieInfo],
-                   reviews_to_show: int = 3,
-                   ranked: bool = False) -> str:
-    lines: list[str] = []
-    for idx, movie in enumerate(movies, 1):
-        display_title = movie.title_cn if movie.title_cn else movie.title_jp
-        if movie.title_cn and movie.title_cn != movie.title_jp:
-            display_title = f"{movie.title_cn}（{movie.title_jp}）"
-
-        douban_url = movie.douban_url or "https://movie.douban.com"
-        douban_score_str = _stars(movie.douban_score)
-
-        reviews_section = ""
-        if movie.douban_short_reviews:
-            review_lines = [
-                f"> 💬 {r}" for r in movie.douban_short_reviews[:reviews_to_show]
-            ]
-            reviews_section = "\n".join(review_lines) + "\n"
-
-        rank_prefix = f"{idx}" if ranked else "◆"
-        block = MOVIE_BLOCK.format(
-            rank=rank_prefix,
-            display_title=display_title,
-            title_jp=movie.title_jp,
-            douban_score_str=douban_score_str,
-            douban_url=douban_url,
-            director=movie.director or "—",
-            cast=movie.cast or "—",
-            genre=movie.genre or "—",
-            theaters=_theater_list(movie) or "—",
-            reviews_section=reviews_section,
-        )
-        lines.append(block)
-    return "\n".join(lines)
-
-
-def _ranking_section(top_movies: list[MovieInfo], top_n: int) -> str:
-    header = (
-        "| 排名 | 电影 | 推荐指数 | 豆瓣评分 | 上映影院 |\n"
-        "|------|------|----------|----------|----------|\n"
-    )
-    rows: list[str] = []
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for idx, movie in enumerate(top_movies[:top_n], 1):
-        display = movie.title_cn if movie.title_cn else movie.title_jp
-        if movie.title_cn and movie.title_cn != movie.title_jp:
-            display = f"{movie.title_cn}"
-        medal = medals.get(idx, str(idx))
-        score_str = f"{movie.recommendation_score:.0f}/100"
-        douban_str = f"{movie.douban_score:.1f}" if movie.douban_score else "—"
-        theaters = _theater_list(movie) or "—"
-        rows.append(RANKING_ROW.format(
-            rank=medal,
-            display_title=display,
-            score_str=score_str,
-            douban_score_str=douban_str,
-            theaters=theaters,
-        ))
-    return header + "\n".join(rows)
-
-
-def generate_briefing(
-    schedules: list[TheaterSchedule],
-    config: dict,
-    target_week_start: Optional[date] = None,
-    issue_number: int = 1,
-) -> tuple[str, list[MovieInfo]]:
-    """Generate a Markdown briefing from all theater schedules.
-
-    Returns:
-        (markdown_string, ranked_movies)
-    """
-    gen_cfg = config.get("generator", {})
-    ranking_cfg = config.get("ranking", {})
-
-    top_n = gen_cfg.get("top_n", 10)
-    reviews_to_show = gen_cfg.get("reviews_to_show", 3)
-    include_next_week = gen_cfg.get("include_next_week", True)
-    title_template = gen_cfg.get(
-        "title_template",
-        "大雄看点映 第{issue_number}期｜{week_start} ~ {week_end}"
-    )
-    subtitle = gen_cfg.get("subtitle", "东京华人电影周报")
-
-    today = date.today()
-    if target_week_start is None:
-        # Use the Monday of the current week
-        target_week_start = today - timedelta(days=today.weekday())
-    week_start, week_end = _week_range(target_week_start)
-
-    # Merge and deduplicate
-    all_movies = merge_schedules(schedules)
-
-    # Score
-    for movie in all_movies:
-        movie.recommendation_score = calculate_recommendation_score(movie, ranking_cfg)
-
-    # Sort by recommendation score
-    ranked = sorted(all_movies, key=lambda m: m.recommendation_score, reverse=True)
-
-    # Split this week / next week
-    next_week_start = week_start + timedelta(weeks=1)
-    next_week_end = next_week_start + timedelta(days=6)
-
-    def _is_this_week(movie: MovieInfo) -> bool:
-        dates = {s.show_date for s in movie.screenings if s.show_date}
-        if not dates:
-            return True  # assume current if no date info
-        return any(week_start <= d <= week_end for d in dates)
-
-    def _is_next_week(movie: MovieInfo) -> bool:
-        dates = {s.show_date for s in movie.screenings if s.show_date}
-        if not dates:
-            return False
-        return any(next_week_start <= d <= next_week_end for d in dates)
-
-    this_week = [m for m in ranked if _is_this_week(m)]
-    next_week = [m for m in ranked if _is_next_week(m)]
-
-    # Build sections
-    title = title_template.format(
-        issue_number=issue_number,
-        week_start=_format_date_jp(week_start),
-        week_end=_format_date_jp(week_end),
-    )
-
-    this_week_section = _movie_section(this_week, reviews_to_show=reviews_to_show)
-    ranking_section = _ranking_section(ranked, top_n)
-
-    if include_next_week and next_week:
-        next_week_section = (
-            f"## 📌 下周预告（{_format_date_jp(next_week_start)}"
-            f" ～ {_format_date_jp(next_week_end)}）\n\n"
-            + _movie_section(next_week[:5], reviews_to_show=1)
-            + "\n\n---\n\n"
-        )
+    name_link = f"[{cn}]({douban_url})" if douban_url else cn
+    eiga_label = orig if orig else title_jp
+    if eiga_url and eiga_label:
+        orig_link = f"[{eiga_label}]({eiga_url})"
     else:
-        next_week_section = ""
+        orig_link = eiga_label or EMPTY_FIELD
 
-    md = TEMPLATE.format(
-        title=title,
-        subtitle=subtitle,
-        week_start=_format_date_jp(week_start),
-        week_end=_format_date_jp(week_end),
-        this_week_section=this_week_section,
-        top_n=top_n,
-        ranking_section=ranking_section,
-        next_week_section=next_week_section,
+    # Stats line — fall back to 新片推荐度 / "no data" when there's no real score
+    score = m.get("douban_score") or 0
+    watched = m.get("watched") or 0
+    want = m.get("want_to_watch") or 0
+    if score:
+        stats_line = STATS_WITH_SCORE.format(score=score, watched=watched, want=want)
+    else:
+        nm_rating = m.get("new_movie_rating")
+        nm_count = m.get("new_movie_rating_count") or 0
+        if nm_rating:
+            stats_line = STATS_WITH_NEW_RATING.format(
+                rating=nm_rating, count=nm_count, watched=watched, want=want,
+            )
+        else:
+            stats_line = STATS_NO_DATA.format(watched=watched, want=want)
+
+    director = (m.get("director") or EMPTY_FIELD).strip() or EMPTY_FIELD
+    cast = (m.get("cast") or EMPTY_FIELD).strip() or EMPTY_FIELD
+    genre = (m.get("genre") or EMPTY_FIELD).strip() or EMPTY_FIELD
+
+    # Theaters: clickable list joined by THEATER_SEP
+    parts: list[str] = []
+    for t in m.get("theaters") or []:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name") or ""
+        url = t.get("url") or ""
+        if not name:
+            continue
+        parts.append(f"[{name}]({url})" if url else name)
+    theaters_line = THEATER_SEP.join(parts) if parts else NO_THEATERS
+
+    # Reviews: prefer watched-status reviews, fall back to whatever exists
+    reviews_data = m.get("short_reviews") or []
+    watched_reviews = [
+        r for r in reviews_data
+        if isinstance(r, dict) and r.get("status") == "watched"
+    ]
+    chosen = watched_reviews[:3] if watched_reviews else reviews_data[:3]
+    review_lines: list[str] = []
+    if not chosen:
+        review_lines.append(REVIEW_NONE)
+    else:
+        for r in chosen:
+            if isinstance(r, dict):
+                text = (r.get("text") or "").strip()
+                author = (r.get("author") or "").strip() or REVIEW_ANONYMOUS
+                if not text:
+                    continue
+                review_lines.append(REVIEW_LINE.format(text=text, author=author))
+            else:
+                review_lines.append(REVIEW_LINE.format(text=r, author=REVIEW_ANONYMOUS))
+    reviews_block = "\n".join(review_lines)
+
+    return MOVIE_BLOCK.format(
+        rank=rank,
+        name_link=name_link,
+        orig_link=orig_link,
+        stats_line=stats_line,
+        director=director,
+        cast=cast,
+        genre=genre,
+        theaters=theaters_line,
+        reviews=reviews_block,
     )
-    return md, ranked
+
+
+def _load_theaters_for_movie(conn, movie_id: str) -> list[dict]:
+    """Return deduplicated [{'name', 'url'}, ...] for a movie via screenings join."""
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT t.name AS name, t.url AS url
+                 FROM screenings s
+                 JOIN theaters t ON s.theater_id = t.theater_id
+                WHERE s.movie_id = ?
+                ORDER BY t.name""",
+            (movie_id,)
+        ).fetchall()
+    except Exception:
+        return []
+    out: list[dict] = []
+    seen: set = set()
+    for r in rows:
+        name = r["name"] if r["name"] is not None else ""
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name, "url": r["url"] or ""})
+    return out
+
+
+# ── Section filters (Python predicates) ─────────────────────────────────────
+#
+# Edit the predicate / sort_key / hide_when_empty here to tweak briefing rules.
+# The section ORDER and visible LABELS come from SECTION_LABELS in
+# briefing_template.py — make sure keys stay in sync.
+
+_RELEASE_DATE_RE = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
+
+
+def _parse_jp_release_date(s: Optional[str]) -> Optional[date]:
+    """Parse eiga.com 劇場公開日 (e.g. '2026年4月10日') into a date object."""
+    if not s:
+        return None
+    m = _RELEASE_DATE_RE.search(s)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _is_recent_release(m: dict, today: date, days: int = 365) -> bool:
+    """Return True if eiga.com 劇場公開日 is within `days` days of today.
+    Future releases (negative delta) also count as recent."""
+    rd = m.get("_release_date_obj")
+    if rd is None:
+        return False
+    return (today - rd).days < days
+
+
+def _year_diff(m: dict, today: date) -> int:
+    """Years between today and the Douban-recorded year (fall back to eiga year)."""
+    y = m.get("douban_year") or m.get("year") or 0
+    if not y:
+        return 0
+    return today.year - int(y)
+
+
+# Each spec: predicate(movie, today) -> bool, sort_key(movie) -> sortable,
+#            hide_when_empty (bool).
+# Keys must match SECTION_LABELS in briefing_template.py.
+_SECTION_SPECS: dict[str, dict] = {
+    # 院线热映: chain + recent release + douban_score>0 + NOT classic.
+    # (year filter prevents recent re-releases of old films from doubling up
+    # with 院线经典.)
+    "院线热映": {
+        "predicate": lambda m, today: (
+            m.get("category") == "chain"
+            and (m.get("douban_score") or 0) > 0
+            and _is_recent_release(m, today, days=365)
+            and _year_diff(m, today) <= 3
+        ),
+        "sort_key": lambda m: -(m.get("douban_score") or 0),
+        "hide_when_empty": False,
+    },
+    # 院线经典: chain + classic (today_year - douban_year > 3) + score>0.
+    "院线经典": {
+        "predicate": lambda m, today: (
+            m.get("category") == "chain"
+            and (m.get("douban_score") or 0) > 0
+            and _year_diff(m, today) > 3
+        ),
+        "sort_key": lambda m: -(m.get("douban_score") or 0),
+        "hide_when_empty": False,
+    },
+    # 小众佳片: indie + score>0.
+    "小众佳片": {
+        "predicate": lambda m, today: (
+            m.get("category") == "indie"
+            and (m.get("douban_score") or 0) > 0
+        ),
+        "sort_key": lambda m: -(m.get("douban_score") or 0),
+        "hide_when_empty": False,
+    },
+    # 院线新片: chain + recent release + no aggregated score + 新片推荐度>3.5.
+    "院线新片": {
+        "predicate": lambda m, today: (
+            m.get("category") == "chain"
+            and (m.get("douban_score") or 0) == 0
+            and (m.get("new_movie_rating") or 0) > 3
+            and _is_recent_release(m, today, days=365)
+        ),
+        "sort_key": lambda m: -(m.get("new_movie_rating") or 0),
+        "hide_when_empty": True,
+    },
+}
+
+
+def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
+    """Load all chain+indie movies with the fields needed for section filtering."""
+    import json as _json
+
+    rows = conn.execute(
+        "SELECT mv.movie_id, mv.title_jp, mv.title_original, mv.eiga_url, "
+        "       mv.year, mv.category, mv.release_date, "
+        "       m.douban_id, m.douban_url, m.title_cn AS m_title_cn, "
+        "       m.douban_score AS m_score, m.douban_year, "
+        "       m.new_movie_rating, m.new_movie_rating_count, "
+        "       d.title_cn AS d_title_cn, d.douban_score AS d_score, "
+        "       d.douban_votes, d.director, d.cast, d.genre, "
+        "       d.want_to_watch, d.watched, d.short_reviews "
+        "  FROM movies mv "
+        "  JOIN douban_matches m ON m.movie_id = mv.movie_id "
+        "  LEFT JOIN douban_details d ON d.movie_id = mv.movie_id "
+        " WHERE mv.category IN ('chain', 'indie') "
+        "   AND m.douban_id IS NOT NULL AND m.douban_id != ''"
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        # Prefer detail values when present
+        d["title_cn"] = d.get("d_title_cn") or d.get("m_title_cn") or ""
+        d["douban_score"] = d.get("d_score") if d.get("d_score") else d.get("m_score") or 0
+        try:
+            d["short_reviews"] = _json.loads(d["short_reviews"]) if d["short_reviews"] else []
+        except Exception:
+            d["short_reviews"] = []
+        d["_release_date_obj"] = _parse_jp_release_date(d.get("release_date"))
+        out.append(d)
+    return out
+
+
+def _select_briefing_sections(all_movies: list[dict], today: date, top_n: int,
+                              extra_n: int = 10) -> list[tuple[str, list[dict], list[dict]]]:
+    """Apply each section predicate to ``all_movies`` and return triples of
+    ``(key, primary_movies, extras)`` in SECTION_LABELS order.
+
+    - ``primary_movies`` are the top ``top_n`` by sort_key (used in the text).
+    - ``extras`` are the next ``extra_n`` candidates (used as poster fallback
+      when one of the primary movies has no fetchable eiga.com photo page).
+
+    Sections marked ``hide_when_empty`` are dropped when ``primary_movies``
+    is empty.
+    """
+    result: list[tuple[str, list[dict], list[dict]]] = []
+    for section_key in SECTION_LABELS.keys():
+        spec = _SECTION_SPECS.get(section_key)
+        if spec is None:
+            continue
+        matched = [m for m in all_movies if spec["predicate"](m, today)]
+        matched.sort(key=spec["sort_key"])
+        primary = matched[:top_n]
+        extras = matched[top_n:top_n + extra_n]
+        if not primary and spec["hide_when_empty"]:
+            continue
+        result.append((section_key, primary, extras))
+    return result
+
+
+def generate_wechat_briefing_md(top_n: int = 5,
+                                output_path: Optional[Path] = None) -> Path:
+    """Generate the WeChat-ready briefing MD.
+
+    Sections are defined by ``SECTION_LABELS`` in ``briefing_template.py`` and
+    their data filters by ``_SECTION_SPECS`` above. Per-movie data is read from
+    ``douban_details`` + ``screenings``/``theaters``. Run ``enrich_for_briefing``
+    first to populate the source tables.
+    """
+    db = Path("data") / "eiga.db"
+    today = date.today()
+    today_s = today.isoformat()
+
+    outdir = Path("output")
+    outdir.mkdir(exist_ok=True)
+
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+
+    all_movies = _load_briefing_candidates(conn, top_n=top_n)
+    # Theater lookups need the same conn — do them lazily per displayed movie.
+    sections = _select_briefing_sections(all_movies, today, top_n)
+
+    # Poster collage support is optional — silently disable if Pillow / network
+    # is unavailable so the briefing can still be generated text-only.
+    try:
+        from .poster_collage import make_section_collage, cleanup_poster_cache
+    except Exception as exc:
+        logger.warning("Poster collage disabled: %s", exc)
+        make_section_collage = None  # type: ignore[assignment]
+        cleanup_poster_cache = None  # type: ignore[assignment]
+
+    # Initialise the Douban session up-front so the poster-collage fallback
+    # (via #mainpic) can reuse it without paying the cold-start cost mid-run.
+    try:
+        from scraper.douban import init_douban_session
+        import yaml as _yaml
+        _cfg_path = Path("config.yaml")
+        if not _cfg_path.exists():
+            _cfg_path = Path("config.yaml.example")
+        if _cfg_path.exists():
+            with _cfg_path.open(encoding="utf-8") as _f:
+                _cfg = _yaml.safe_load(_f) or {}
+            init_douban_session(_cfg.get("douban", {}))
+    except Exception as exc:
+        logger.debug("Douban session init skipped: %s", exc)
+
+    parts: list[str] = [BRIEFING_HEADER.format(date_str=today.strftime(DATE_FORMAT))]
+
+    for section_key, movies, extras in sections:
+        heading, subtitle = SECTION_LABELS[section_key]
+        parts.append(SECTION_HEADER.format(heading=heading, subtitle=subtitle))
+
+        # Section poster collage. Pass (eiga_id, douban_id) pairs ordered by
+        # priority (primary top-N first, then extras as fallback for missing
+        # posters). For each pair, eiga.com is tried first and Douban's
+        # ``#mainpic`` is used as fallback when eiga fails (e.g. 410 Gone).
+        if make_section_collage is not None and movies:
+            try:
+                collage_path = make_section_collage(
+                    section_key=section_key,
+                    movie_specs=(
+                        [(m["movie_id"], m.get("douban_id")) for m in movies]
+                        + [(m["movie_id"], m.get("douban_id")) for m in extras]
+                    ),
+                    date_str=today_s,
+                )
+            except Exception as exc:
+                logger.warning("Collage failed for %s: %s", section_key, exc)
+                collage_path = None
+            if collage_path is not None:
+                try:
+                    rel = collage_path.relative_to(outdir).as_posix()
+                except ValueError:
+                    rel = collage_path.as_posix()
+                parts.append(f"![{heading}]({rel})\n")
+
+        if not movies:
+            parts.append(SECTION_EMPTY_PLACEHOLDER + "\n")
+            continue
+        for idx, m in enumerate(movies, 1):
+            m["theaters"] = _load_theaters_for_movie(conn, m["movie_id"])
+            eiga_url = m.get("eiga_url") or (
+                f"https://eiga.com/movie/{m['movie_id']}/" if m.get("movie_id") else None
+            )
+            parts.append(_briefing_format_movie(idx, m, eiga_url) + "\n")
+
+    conn.close()
+
+    # All collages assembled — the per-movie poster cache is no longer needed.
+    if cleanup_poster_cache is not None:
+        try:
+            cleanup_poster_cache()
+        except Exception as exc:
+            logger.debug("Poster cache cleanup failed: %s", exc)
+
+    outp = output_path or outdir / f"briefing_{today_s}.md"
+    outp.write_text("\n".join(parts), encoding="utf-8")
+    logger.info("WeChat briefing saved: %s", outp)
+    return outp
+
+
+def select_briefing_movie_ids(top_n: int = 5) -> set[str]:
+    """Return the set of movie_ids that would be displayed in the briefing.
+
+    Used by ``enrich_for_briefing`` to figure out which movies need their
+    detail page fetched (director/cast/want/watched/reviews). Only the
+    primary top-N per section is returned — fallback "extras" for the
+    poster collage don't need full enrichment.
+    """
+    db = Path("data") / "eiga.db"
+    today = date.today()
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        all_movies = _load_briefing_candidates(conn, top_n=top_n)
+    finally:
+        conn.close()
+    selected: set[str] = set()
+    for _key, movies, _extras in _select_briefing_sections(all_movies, today, top_n):
+        for m in movies:
+            selected.add(m["movie_id"])
+    return selected

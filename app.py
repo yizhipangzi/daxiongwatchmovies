@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""app.py — 大雄看点映 审核发布界面
+"""app.py — 大熊看点映 审核发布界面
 
 提供一个本地 Flask Web 应用，用于：
 1. 浏览已生成的简报 Markdown
@@ -25,7 +25,7 @@ import markdown
 import yaml
 from flask import (
     Flask, render_template, request, redirect, url_for,
-    flash, jsonify,
+    flash, jsonify, send_from_directory, abort,
 )
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -109,7 +109,7 @@ def extract_title(md_content: str) -> str:
         line = line.strip()
         if line.startswith("# "):
             return line[2:].strip()
-    return "大雄看点映"
+    return "大熊看点映"
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -207,6 +207,7 @@ def publish(filename: str):
             md_content=content,
             digest=digest,
             as_draft_only=draft_only,
+            image_base_dir=OUTPUT_DIR,
         )
         status = "草稿" if draft_only else "已发布"
         flash(
@@ -236,6 +237,35 @@ def delete(filename: str):
     return redirect(url_for("index"))
 
 
+# Briefing MDs reference images via relative paths like ``collages/foo.jpg``.
+# When the MD is rendered at ``/review/briefing_xxx.md``, the browser resolves
+# the relative image URL to ``/review/collages/foo.jpg`` — this route serves
+# those assets directly out of OUTPUT_DIR's ``collages/`` and ``posters/``
+# subdirectories. Filenames are restricted to safe image patterns and a
+# path-traversal check confirms the resolved path stays inside OUTPUT_DIR.
+_IMG_FILENAME_RE = re.compile(
+    r"[A-Za-z0-9_\-]+\.(jpg|jpeg|png|webp|gif)",
+    flags=re.IGNORECASE,
+)
+
+
+@app.route("/review/<subdir>/<filename>")
+def review_asset(subdir: str, filename: str):
+    if subdir not in ("collages", "posters"):
+        abort(404)
+    if not _IMG_FILENAME_RE.fullmatch(filename):
+        abort(404)
+    target_dir = (OUTPUT_DIR / subdir).resolve()
+    try:
+        target = (target_dir / filename).resolve()
+        target.relative_to(target_dir)
+    except (ValueError, OSError):
+        abort(404)
+    if not target.is_file():
+        abort(404)
+    return send_from_directory(target_dir, filename)
+
+
 @app.route("/new")
 def new_briefing():
     """Trigger a fresh scrape and redirect to the result."""
@@ -248,7 +278,7 @@ def new_briefing():
 def main() -> None:
     global CONFIG, OUTPUT_DIR
 
-    parser = argparse.ArgumentParser(description="大雄看点映 审核发布界面")
+    parser = argparse.ArgumentParser(description="大熊看点映 审核发布界面")
     parser.add_argument("--port", type=int, default=0,
                         help="端口号（默认: 读取 config.yaml）")
     parser.add_argument("--host", default="",
@@ -270,7 +300,7 @@ def main() -> None:
     configured_key = app_cfg.get("secret_key", "")
     app.secret_key = configured_key.encode() if configured_key else os.urandom(24)
 
-    print(f"\n🎬  大雄看点映 审核发布界面")
+    print(f"\n🎬  大熊看点映 审核发布界面")
     print(f"🌐  访问地址: http://{host}:{port}")
     print(f"📁  简报目录: {OUTPUT_DIR.resolve()}\n")
 
