@@ -423,6 +423,7 @@ def match_movies(categories: tuple = ("chain", "indie"),
     results = {c: [] for c in categories}
     score_tracker = _FetchRetryTracker(label="Score refresh")
     _search_count = 0  # counts new-movie searches (not score refreshes)
+    _skipped_refreshed_today = 0  # verified matches whose score was already refreshed today
 
     for i, mov in enumerate(movies, 1):
         mid = mov["movie_id"]
@@ -441,7 +442,9 @@ def match_movies(categories: tuple = ("chain", "indie"),
                     "SELECT 1 FROM douban_matches_history WHERE movie_id=? AND snapshot_at>=?",
                     (mid, today_str)
                 ).fetchone()
-                if not refreshed_today and score_tracker.should_continue():
+                if refreshed_today:
+                    _skipped_refreshed_today += 1
+                elif score_tracker.should_continue():
                     logger.info("[%d/%d] %s | %s — refreshing score",
                                 i, len(movies), cat, mov["title_jp"])
                     try:
@@ -623,6 +626,9 @@ def match_movies(categories: tuple = ("chain", "indie"),
         pass
 
     matched = sum(len(v) for v in results.values())
+    if _skipped_refreshed_today:
+        logger.info("Score refresh: skipped %d movie(s) already refreshed today",
+                    _skipped_refreshed_today)
     logger.info("=== Douban matching complete: %d/%d matched ===", matched, len(movies))
     return results
 
@@ -748,6 +754,7 @@ def enrich_for_briefing(top_n: int = 5, delay: float = 2.0) -> int:
     _ensure_douban_table(conn)
 
     now = datetime.now().isoformat(timespec="seconds")
+    today_str = now[:10]
 
     # Ask the briefing generator which movie_ids it would display, then
     # enrich exactly those.
@@ -760,13 +767,19 @@ def enrich_for_briefing(top_n: int = 5, delay: float = 2.0) -> int:
     placeholders = ",".join("?" for _ in wanted_ids)
     rows = conn.execute(
         f"""SELECT m.movie_id, m.douban_id,
-                   mv.year AS movie_year, mv.country AS movie_country
+                   mv.year AS movie_year, mv.country AS movie_country,
+                   SUBSTR(COALESCE(d.updated_at, ''), 1, 10) AS details_day
               FROM douban_matches m JOIN movies mv ON m.movie_id=mv.movie_id
+              LEFT JOIN douban_details d ON d.movie_id=m.movie_id
              WHERE m.movie_id IN ({placeholders})""",
         tuple(wanted_ids),
     ).fetchall()
     targets: list[dict] = []
+    skipped_today = 0
     for r in rows:
+        if r["details_day"] == today_str:
+            skipped_today += 1
+            continue
         targets.append({
             "section": "briefing",
             "movie_id": r["movie_id"],
@@ -774,6 +787,10 @@ def enrich_for_briefing(top_n: int = 5, delay: float = 2.0) -> int:
             "movie_year": r["movie_year"],
             "movie_country": r["movie_country"],
         })
+
+    if skipped_today:
+        logger.info("Briefing enrich: skipping %d movie(s) already enriched today",
+                    skipped_today)
 
     if not targets:
         logger.info("Briefing enrich: no candidates")
@@ -908,19 +925,32 @@ def enrich_new_movie_ratings(delay: float = 2.0) -> int:
     now = datetime.now().isoformat(timespec="seconds")
     today_str = now[:10]
 
+    skipped_done_today = conn.execute(
+        """SELECT COUNT(*) FROM douban_matches
+           WHERE douban_id IS NOT NULL AND douban_id != ''
+             AND COALESCE(douban_score, 0) = 0
+             AND SUBSTR(COALESCE(new_movie_rating_at, ''), 1, 10) = ?""",
+        (today_str,)
+    ).fetchone()[0]
+
     rows = conn.execute(
         """SELECT m.movie_id, m.douban_id, mv.title_jp
            FROM douban_matches m
            JOIN movies mv ON m.movie_id = mv.movie_id
            WHERE m.douban_id IS NOT NULL AND m.douban_id != ''
              AND COALESCE(m.douban_score, 0) = 0
+             AND SUBSTR(COALESCE(m.new_movie_rating_at, ''), 1, 10) != ?
              AND EXISTS (
                  SELECT 1 FROM douban_matches_history h
                  WHERE h.movie_id = m.movie_id
                    AND SUBSTR(h.snapshot_at, 1, 10) = ?
              )""",
-        (today_str,)
+        (today_str, today_str)
     ).fetchall()
+
+    if skipped_done_today:
+        logger.info("New-movie rating: skipping %d movie(s) already rated today",
+                    skipped_done_today)
 
     if not rows:
         logger.info("New-movie rating: no candidates")
@@ -1062,14 +1092,30 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
                 unmatched.append(dict(m))
 
     if unmatched:
+        # Load skip-list entries so we can mark which unmatched movies are
+        # permanently skipped vs. just temporarily un-resolvable.
+        skip_map: dict = {}
+        try:
+            conn_sk = _get_db()
+            for r in conn_sk.execute("SELECT movie_id, reason FROM douban_skip_list").fetchall():
+                skip_map[r["movie_id"]] = r["reason"] or ""
+            conn_sk.close()
+        except Exception:
+            skip_map = {}
+
         um_lines = ["", "---", "", "## 未匹配（未找到豆瓣条目）", ""]
-        um_lines.append("| # | Movie ID | タイトル | カテゴリ |")
-        um_lines.append("|---|----------|---------|----------|")
+        um_lines.append("| # | Movie ID | タイトル | カテゴリ | 状態 |")
+        um_lines.append("|---|----------|---------|----------|------|")
         for i, m in enumerate(unmatched, 1):
             title = str(m.get("title_jp") or "-").replace('|', '')
             mid = m.get("movie_id") or "-"
             cat = m.get("category") or "-"
-            um_lines.append(f"| {i} | {mid} | {title} | {cat} |")
+            if mid in skip_map:
+                reason = skip_map[mid].replace('|', '')
+                status = f"Skip list（{reason}）" if reason else "Skip list"
+            else:
+                status = "未マッチ（再試行）"
+            um_lines.append(f"| {i} | {mid} | {title} | {cat} | {status} |")
         # Append to file
         with md_path.open("a", encoding="utf-8") as f:
             f.write("\n" + "\n".join(um_lines))

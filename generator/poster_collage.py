@@ -102,14 +102,68 @@ def fetch_eiga_poster(movie_id: str,
         return None
 
 
+def _looks_like_bot_check(soup) -> bool:
+    """Heuristic: True when the page is Douban's JS proof-of-work challenge
+    rather than a real subject page. Such pages have no #mainpic and no
+    og:image, plus a tiny body and the form#sec used for the JS challenge."""
+    if soup is None:
+        return True
+    if soup.select_one("#mainpic img"):
+        return False
+    if soup.find("meta", property="og:image"):
+        return False
+    return bool(soup.select_one("form#sec"))
+
+
+def _fetch_douban_page_pw(douban_id: str) -> Optional[BeautifulSoup]:
+    """Open the Douban subject page in Playwright (which executes the JS
+    proof-of-work challenge served by HTTP-only requests) and return the
+    parsed HTML. Returns None if the persistent Playwright context isn't
+    available or the real page never renders.
+
+    Intentionally does NOT call _handle_bot_check — that helper waits up
+    to 3 minutes for human CAPTCHA solving, which is wrong for batch
+    poster-fetching. The JS PoW page auto-submits its form in ~500ms and
+    Playwright follows the redirect to the real subject page; we just
+    wait for #mainpic img to appear.
+    """
+    try:
+        from scraper.douban import _ensure_pw_context
+    except Exception as exc:
+        logger.debug("poster: Playwright unavailable: %s", exc)
+        return None
+    ctx = _ensure_pw_context()
+    if ctx is None:
+        logger.debug("poster: Playwright context unavailable — skipping")
+        return None
+    url = f"https://movie.douban.com/subject/{douban_id}/"
+    try:
+        page = ctx.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_selector("#mainpic img", timeout=15000)
+            except Exception:
+                pass
+            html = page.content()
+        finally:
+            page.close()
+        return BeautifulSoup(html, "lxml")
+    except Exception as exc:
+        logger.warning("poster: Playwright Douban fetch error for %s: %s",
+                       douban_id, exc)
+        return None
+
+
 def fetch_douban_poster(douban_id: str,
                         delay: float = 1.0,
                         cache_dir: Path = POSTER_CACHE_DIR) -> Optional[Path]:
     """Fetch the Douban subject page main poster (``#mainpic img``).
 
     Used as a fallback when eiga.com has no usable photo page (e.g. very old
-    films returning 410 Gone). The Douban page is fetched via the existing
-    anti-bot session in ``scraper.douban`` so we get a real HTML response.
+    films returning 410 Gone). Tries the existing HTTP session in
+    ``scraper.douban`` first; if that returns Douban's JS proof-of-work
+    bot-check page, escalates to Playwright (which executes the challenge).
     """
     if not douban_id:
         return None
@@ -124,19 +178,27 @@ def fetch_douban_poster(douban_id: str,
     except Exception as exc:
         logger.warning("poster: Douban fetch error for subject %s: %s",
                        douban_id, exc)
-        return None
+        soup = None
+
+    if _looks_like_bot_check(soup):
+        logger.info("poster: HTTP fetch returned bot-check for %s — trying Playwright",
+                    douban_id)
+        soup = _fetch_douban_page_pw(str(douban_id))
+
     if soup is None:
         logger.warning("poster: Douban page unreachable for subject %s", douban_id)
         return None
 
     el = soup.select_one("#mainpic img")
-    if not el:
-        logger.warning("poster: no #mainpic img on Douban subject %s", douban_id)
-        return None
-    img_url = el.get("src") or el.get("data-src")
+    img_url = (el.get("src") or el.get("data-src")) if el else None
     if not img_url:
-        logger.warning("poster: #mainpic img has no src on Douban subject %s",
-                       douban_id)
+        # Final fallback: og:image meta tag (often present even when
+        # #mainpic structure varies between Douban page versions).
+        meta = soup.find("meta", property="og:image")
+        if meta and meta.get("content"):
+            img_url = meta["content"]
+    if not img_url:
+        logger.warning("poster: no poster image on Douban subject %s", douban_id)
         return None
 
     # Reuse the Douban session (cookies + Chrome TLS fingerprint via curl_cffi)

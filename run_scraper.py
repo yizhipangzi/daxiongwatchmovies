@@ -15,7 +15,6 @@ import argparse
 import json
 import logging
 import os
-import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -236,19 +235,6 @@ def _load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f) or {}
 
 
-def _issue_number(output_dir: Path) -> int:
-    """Auto-detect next issue number from existing output files."""
-    existing = list(output_dir.glob("briefing_*.md"))
-    if not existing:
-        return 1
-    nums = []
-    for p in existing:
-        m = re.search(r"briefing_(\d+)_", p.name)
-        if m:
-            nums.append(int(m.group(1)))
-    return (max(nums) + 1) if nums else 1
-
-
 # ── DB fallback helpers ───────────────────────────────────────────────────────
 
 def _load_movies_from_db() -> list[MovieInfo]:
@@ -318,9 +304,7 @@ def main() -> None:
     parser.add_argument("--no-scan", action="store_true",
                         help="不进行网络扫描，只从本地 DB 生成 MD（快速预览）")
     parser.add_argument("--output", default="",
-                        help="输出文件路径（默认: output/briefing_N_YYYY-MM-DD.md）")
-    parser.add_argument("--issue", type=int, default=0,
-                        help="手动指定期号（默认: 自动检测）")
+                        help="输出文件路径（默认: output/briefing_YYYY-MM-DD.md）")
     parser.add_argument("--config", default="config.yaml",
                         help="配置文件路径")
     parser.add_argument("--resume", action="store_true",
@@ -332,7 +316,6 @@ def main() -> None:
     output_dir = Path(config.get("generator", {}).get("output_dir", "output"))
     output_dir.mkdir(exist_ok=True)
 
-    issue_number = args.issue or _issue_number(output_dir)
     today = date.today()
 
     # ── Scrape ───────────────────────────────────────────────────────────────
@@ -410,7 +393,7 @@ def main() -> None:
     if args.output:
         out_path = Path(args.output)
     else:
-        out_path = output_dir / f"briefing_{issue_number:03d}_{today.isoformat()}.md"
+        out_path = output_dir / f"briefing_{today.isoformat()}.md"
     generate_wechat_briefing_md(top_n=5, output_path=out_path)
 
     logger.info("简报已保存: %s", out_path)

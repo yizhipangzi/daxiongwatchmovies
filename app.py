@@ -66,8 +66,9 @@ def _safe_filename(filename: str) -> str:
     path-traversal attacks (e.g. '../../etc/passwd').
     Raises ValueError for invalid filenames.
     """
-    # Allow: briefing_NNN_YYYY-MM-DD.md, step1_YYYY-MM-DD.md, step2_YYYY-MM-DD.md, step3_YYYY-MM-DD.md
-    if not re.fullmatch(r"(briefing_\d+_\d{4}-\d{2}-\d{2}|step\d+_\d{4}-\d{2}-\d{2})\.md", filename):
+    # Allow: briefing_YYYY-MM-DD.md, briefing_NNN_YYYY-MM-DD.md (legacy),
+    #        step1_YYYY-MM-DD.md, step2_YYYY-MM-DD.md, step3_YYYY-MM-DD.md
+    if not re.fullmatch(r"(briefing_(\d+_)?\d{4}-\d{2}-\d{2}|step\d+_\d{4}-\d{2}-\d{2})\.md", filename):
         raise ValueError(f"Invalid filename: {filename!r}")
     return filename
 
