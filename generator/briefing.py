@@ -35,17 +35,28 @@ from .briefing_template import (
     STATS_WITH_SCORE,
     STATS_WITH_NEW_RATING,
     STATS_NO_DATA,
+    STATS_WITH_EIGA_RATING,
     REVIEW_LINE,
     REVIEW_NONE,
     REVIEW_ANONYMOUS,
+    REVIEW_HEADING_DOUBAN,
+    REVIEW_HEADING_EIGA,
+    EIGA_REVIEW_LINE,
+    EIGA_REVIEW_LINE_JA_ONLY,
     THEATER_SEP,
     NO_THEATERS,
     EMPTY_FIELD,
 )
 
 
-def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str]) -> str:
-    """Render one movie block by filling in the MOVIE_BLOCK template."""
+def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str],
+                           review_source: str = "douban") -> str:
+    """Render one movie block.
+
+    ``review_source`` is ``"douban"`` (default) or ``"eiga"``. When ``"eiga"``,
+    the stats line uses the eiga.com rating and reviews come from
+    ``m["eiga_reviews"]`` (already translated by step2 enrichment).
+    """
     cn = (m.get("title_cn") or m.get("title_jp") or "").strip()
     title_jp = (m.get("title_jp") or "").strip()
     orig = (m.get("title_original") or "").strip()
@@ -58,21 +69,31 @@ def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str]) -> str:
     else:
         orig_link = eiga_label or EMPTY_FIELD
 
-    # Stats line — fall back to 新片推荐度 / "no data" when there's no real score
-    score = m.get("douban_score") or 0
+    # Stats line — picked by review_source and what data is available.
     watched = m.get("watched") or 0
     want = m.get("want_to_watch") or 0
-    if score:
-        stats_line = STATS_WITH_SCORE.format(score=score, watched=watched, want=want)
-    else:
-        nm_rating = m.get("new_movie_rating")
-        nm_count = m.get("new_movie_rating_count") or 0
-        if nm_rating:
-            stats_line = STATS_WITH_NEW_RATING.format(
-                rating=nm_rating, count=nm_count, watched=watched, want=want,
+    if review_source == "eiga":
+        eiga_rating = m.get("eiga_rating") or 0
+        eiga_rating_count = m.get("eiga_rating_count") or 0
+        if eiga_rating:
+            stats_line = STATS_WITH_EIGA_RATING.format(
+                rating=eiga_rating, count=eiga_rating_count,
             )
         else:
             stats_line = STATS_NO_DATA.format(watched=watched, want=want)
+    else:
+        score = m.get("douban_score") or 0
+        if score:
+            stats_line = STATS_WITH_SCORE.format(score=score, watched=watched, want=want)
+        else:
+            nm_rating = m.get("new_movie_rating")
+            nm_count = m.get("new_movie_rating_count") or 0
+            if nm_rating:
+                stats_line = STATS_WITH_NEW_RATING.format(
+                    rating=nm_rating, count=nm_count, watched=watched, want=want,
+                )
+            else:
+                stats_line = STATS_NO_DATA.format(watched=watched, want=want)
 
     director = (m.get("director") or EMPTY_FIELD).strip() or EMPTY_FIELD
     cast = (m.get("cast") or EMPTY_FIELD).strip() or EMPTY_FIELD
@@ -90,26 +111,47 @@ def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str]) -> str:
         parts.append(f"[{name}]({url})" if url else name)
     theaters_line = THEATER_SEP.join(parts) if parts else NO_THEATERS
 
-    # Reviews: prefer watched-status reviews, fall back to whatever exists
-    reviews_data = m.get("short_reviews") or []
-    watched_reviews = [
-        r for r in reviews_data
-        if isinstance(r, dict) and r.get("status") == "watched"
-    ]
-    chosen = watched_reviews[:3] if watched_reviews else reviews_data[:3]
+    # Reviews
     review_lines: list[str] = []
-    if not chosen:
-        review_lines.append(REVIEW_NONE)
+    if review_source == "eiga":
+        review_heading = REVIEW_HEADING_EIGA
+        eiga_revs = m.get("eiga_reviews") or []
+        for r in eiga_revs[:3]:
+            body_zh = (r.get("body_zh") or "").strip()
+            body_ja = (r.get("body_ja") or "").strip()
+            author = (r.get("author") or "").strip() or REVIEW_ANONYMOUS
+            rating = r.get("rating")
+            rating_s = f"{rating:.1f}" if isinstance(rating, (int, float)) else "?"
+            if body_zh:
+                review_lines.append(EIGA_REVIEW_LINE.format(
+                    rating=rating_s, text_zh=body_zh, author=author,
+                ))
+            elif body_ja:
+                review_lines.append(EIGA_REVIEW_LINE_JA_ONLY.format(
+                    rating=rating_s, text_ja=body_ja, author=author,
+                ))
+        if not review_lines:
+            review_lines.append(REVIEW_NONE)
     else:
-        for r in chosen:
-            if isinstance(r, dict):
-                text = (r.get("text") or "").strip()
-                author = (r.get("author") or "").strip() or REVIEW_ANONYMOUS
-                if not text:
-                    continue
-                review_lines.append(REVIEW_LINE.format(text=text, author=author))
-            else:
-                review_lines.append(REVIEW_LINE.format(text=r, author=REVIEW_ANONYMOUS))
+        review_heading = REVIEW_HEADING_DOUBAN
+        reviews_data = m.get("short_reviews") or []
+        watched_reviews = [
+            r for r in reviews_data
+            if isinstance(r, dict) and r.get("status") == "watched"
+        ]
+        chosen = watched_reviews[:3] if watched_reviews else reviews_data[:3]
+        if not chosen:
+            review_lines.append(REVIEW_NONE)
+        else:
+            for r in chosen:
+                if isinstance(r, dict):
+                    text = (r.get("text") or "").strip()
+                    author = (r.get("author") or "").strip() or REVIEW_ANONYMOUS
+                    if not text:
+                        continue
+                    review_lines.append(REVIEW_LINE.format(text=text, author=author))
+                else:
+                    review_lines.append(REVIEW_LINE.format(text=r, author=REVIEW_ANONYMOUS))
     reviews_block = "\n".join(review_lines)
 
     return MOVIE_BLOCK.format(
@@ -120,6 +162,7 @@ def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str]) -> str:
         director=director,
         cast=cast,
         genre=genre,
+        review_heading=review_heading,
         theaters=theaters_line,
         reviews=reviews_block,
     )
@@ -224,15 +267,19 @@ _SECTION_SPECS: dict[str, dict] = {
         "sort_key": lambda m: -(m.get("douban_score") or 0),
         "hide_when_empty": False,
     },
-    # 院线新片: chain + recent release + no aggregated score + 新片推荐度>3.5.
-    "院线新片": {
+    # 电影日和: chain + recent release + no Douban score + has eiga rating,
+    # sorted by eiga rating desc. Replaces the old 院线新片 (which used
+    # Douban's 新片推荐度) so Japanese-audience signal is used when Douban
+    # hasn't yet aggregated a score.
+    "电影日和": {
         "predicate": lambda m, today: (
             m.get("category") == "chain"
             and (m.get("douban_score") or 0) == 0
-            and (m.get("new_movie_rating") or 0) > 3
+            and (m.get("eiga_rating") or 0) > 0
             and _is_recent_release(m, today, days=365)
+            and _year_diff(m, today) <= 3
         ),
-        "sort_key": lambda m: -(m.get("new_movie_rating") or 0),
+        "sort_key": lambda m: -(m.get("eiga_rating") or 0),
         "hide_when_empty": True,
     },
 }
@@ -242,9 +289,13 @@ def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
     """Load all chain+indie movies with the fields needed for section filtering."""
     import json as _json
 
+    # LEFT JOIN douban_matches so 电影日和 candidates without a Douban entry
+    # still surface. Their predicate (douban_score == 0 + has eiga_rating)
+    # gates them in; everything else is filtered by per-section predicates.
     rows = conn.execute(
         "SELECT mv.movie_id, mv.title_jp, mv.title_original, mv.eiga_url, "
         "       mv.year, mv.category, mv.release_date, "
+        "       mv.eiga_rating, mv.eiga_rating_count, "
         "       m.douban_id, m.douban_url, m.title_cn AS m_title_cn, "
         "       m.douban_score AS m_score, m.douban_year, "
         "       m.new_movie_rating, m.new_movie_rating_count, "
@@ -252,10 +303,9 @@ def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
         "       d.douban_votes, d.director, d.cast, d.genre, "
         "       d.want_to_watch, d.watched, d.short_reviews "
         "  FROM movies mv "
-        "  JOIN douban_matches m ON m.movie_id = mv.movie_id "
+        "  LEFT JOIN douban_matches m ON m.movie_id = mv.movie_id "
         "  LEFT JOIN douban_details d ON d.movie_id = mv.movie_id "
-        " WHERE mv.category IN ('chain', 'indie') "
-        "   AND m.douban_id IS NOT NULL AND m.douban_id != ''"
+        " WHERE mv.category IN ('chain', 'indie')"
     ).fetchall()
     out: list[dict] = []
     for r in rows:
@@ -270,6 +320,23 @@ def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
         d["_release_date_obj"] = _parse_jp_release_date(d.get("release_date"))
         out.append(d)
     return out
+
+
+def _load_eiga_reviews(conn, movie_id: str) -> list[dict]:
+    """Pull cached eiga.com reviews (with translations) for one movie."""
+    try:
+        rows = conn.execute(
+            """SELECT position, review_id, rating,
+                       title_ja, title_zh, author, date_str,
+                       body_ja, body_zh
+                  FROM eiga_reviews
+                 WHERE movie_id = ?
+                 ORDER BY position""",
+            (movie_id,),
+        ).fetchall()
+    except Exception:
+        return []
+    return [dict(r) for r in rows]
 
 
 def _select_briefing_sections(all_movies: list[dict], today: date, top_n: int,
@@ -379,12 +446,17 @@ def generate_wechat_briefing_md(top_n: int = 5,
         if not movies:
             parts.append(SECTION_EMPTY_PLACEHOLDER + "\n")
             continue
+        review_source = "eiga" if section_key == "电影日和" else "douban"
         for idx, m in enumerate(movies, 1):
             m["theaters"] = _load_theaters_for_movie(conn, m["movie_id"])
             eiga_url = m.get("eiga_url") or (
                 f"https://eiga.com/movie/{m['movie_id']}/" if m.get("movie_id") else None
             )
-            parts.append(_briefing_format_movie(idx, m, eiga_url) + "\n")
+            if review_source == "eiga":
+                m["eiga_reviews"] = _load_eiga_reviews(conn, m["movie_id"])
+            parts.append(
+                _briefing_format_movie(idx, m, eiga_url, review_source=review_source) + "\n"
+            )
 
     conn.close()
 
@@ -422,3 +494,25 @@ def select_briefing_movie_ids(top_n: int = 5) -> set[str]:
         for m in movies:
             selected.add(m["movie_id"])
     return selected
+
+
+def select_section_movie_ids(section_key: str, top_n: int = 5) -> list[str]:
+    """Return movie_ids that the named section would display, in display order.
+
+    Used by step2's eiga-review enrichment so it only translates reviews for
+    movies the 电影日和 section will actually render.
+    """
+    spec = _SECTION_SPECS.get(section_key)
+    if spec is None:
+        return []
+    db = Path("data") / "eiga.db"
+    today = date.today()
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        all_movies = _load_briefing_candidates(conn, top_n=top_n)
+    finally:
+        conn.close()
+    matched = [m for m in all_movies if spec["predicate"](m, today)]
+    matched.sort(key=spec["sort_key"])
+    return [m["movie_id"] for m in matched[:top_n]]

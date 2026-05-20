@@ -847,6 +847,12 @@ def _validate_via_page(subject_id: str, orig_title: str,
             on == _norm(c) or on in _norm(c) or _norm(c) in on
             for c in candidates if c
         )
+        # Soft fallback: substring fails when eiga's title is missing articles
+        # ("Chaplin: Spirit of the Tramp" vs Douban "Charlie Chaplin: The Spirit
+        # of the Tramp"). Token-subset is safe here because year+country below
+        # still gate the match.
+        if not title_matched and on:
+            title_matched = _title_token_overlap(orig_title, candidates)
         if not title_matched and on:
             title_matched = on in _norm(soup.get_text(separator=" "))
         if not title_matched:
@@ -877,6 +883,35 @@ def _strip_diacritics(s: str) -> str:
     return "".join(
         c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)
     )
+
+
+_TITLE_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "of", "and", "or", "in", "on", "to", "for", "with",
+    "de", "la", "le", "el", "und", "et",
+})
+
+
+def _title_tokens(s: str) -> set[str]:
+    """Significant lowercase tokens from a Latin/mixed title (accents stripped)."""
+    s = _strip_diacritics(s).lower()
+    return {t for t in re.split(r"[^a-z0-9]+", s) if t and t not in _TITLE_STOPWORDS}
+
+
+def _title_token_overlap(orig_title: str, candidates: list[str]) -> bool:
+    """Soft title match: every content token of orig_title appears in a candidate.
+
+    Lets eiga's shorter foreign title ("Chaplin: Spirit of the Tramp") match a
+    Douban entry with a richer name ("Charlie Chaplin: The Spirit of the Tramp")
+    without admitting unrelated films. Requires ≥2 content tokens so a single
+    shared word can't trigger a false positive.
+    """
+    orig_toks = _title_tokens(orig_title)
+    if len(orig_toks) < 2:
+        return False
+    for c in candidates:
+        if c and orig_toks.issubset(_title_tokens(c)):
+            return True
+    return False
 
 
 def search_douban(title_jp: str, year: int = 0,

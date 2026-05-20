@@ -88,6 +88,15 @@ douban:
   # HTTP 代理（可选），格式如 http://127.0.0.1:7890
   proxy: ""
 
+# ── DeepL 翻译（电影日和 板块的日语短评翻译成中文） ────────────────
+deepl:
+  # DeepL API key.
+  # Free 方案 (https://www.deepl.com/pro-api) key 以 ":fx" 结尾，每月 500k 字。
+  # 留空则跳过翻译，简报里原文显示。
+  api_key: ""
+  # 目标语言：ZH（简体）/ ZH-HANS / ZH-HANT（繁体）
+  target_lang: "ZH"
+
 # ── 评分权重（推荐度算法） ───────────────────────────────────
 ranking:
   # 豆瓣评分（满分10分）→ 权重

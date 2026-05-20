@@ -31,8 +31,8 @@ BRIEFING_HEADER = """\
 # Each value is (heading, subtitle).
 SECTION_LABELS: dict[str, tuple[str, str]] = {
     "院线热映": ("🎬 院线热映", "最新院线大片推荐"),
+    "电影日和": ("🌸 电影日和", "豆瓣暂无评分，日本观众好评的电影"),
     "院线经典": ("🎞️ 院线经典", "经典老片重映"),
-    "院线新片": ("🆕 院线新片", "未评分但早期口碑很好的新片"),
     "小众佳片": ("🎨 小众佳片", "独立艺术影院的高分好片"),
 }
 
@@ -62,16 +62,28 @@ SECTION_EMPTY_PLACEHOLDER = "（暂无符合条件的电影）"
 MOVIE_BLOCK = """\
 
 **{rank}. {name_link}（{orig_link}）**
- 
+
 ⭐ {stats_line}
 👤 导演 {director}
 🎭 主演 {cast}
 🏷️ 类型 {genre}
-📰 豆瓣短评
+📰 {review_heading}
 {reviews}
 📍 上映影院
 {theaters}\
 """
+
+# Header for the reviews block — varies by data source.
+REVIEW_HEADING_DOUBAN = "豆瓣短评"
+REVIEW_HEADING_EIGA = "eiga.com 短评（自动翻译）"
+
+# Per-review line variant for eiga 电影日和: shows the reviewer's 1-5 star
+# rating and pairs the translated text with a short snippet of the original
+# Japanese so readers who know JP can spot translation glitches.
+#   Placeholders: rating, text_zh, text_ja, author
+EIGA_REVIEW_LINE = " {rating}★ {text_zh} -{author}"
+# When translation failed / wasn't configured — show original JP.
+EIGA_REVIEW_LINE_JA_ONLY = " {rating}★ {text_ja} -{author}"
 
 
 # ── Stats line variants (used inside MOVIE_BLOCK) ──────────────────────────
@@ -86,6 +98,10 @@ STATS_WITH_NEW_RATING = "新片推荐度 {rating:.1f}/5 ({count}) / {watched}看
 # Fallback when there is no score and no new-movie rating.
 #   Placeholders: watched, want
 STATS_NO_DATA = "-分 / {watched}看过 / {want}想看"
+
+# 电影日和 板块：用 eiga.com 的日本观众评分代替豆瓣分。
+#   Placeholders: rating, count
+STATS_WITH_EIGA_RATING = "eiga.com {rating:.1f}/5（{count}人评价）"
 
 
 # ── Short review lines (used inside MOVIE_BLOCK's reviews block) ───────────

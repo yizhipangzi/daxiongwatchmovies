@@ -211,6 +211,24 @@ def _ensure_douban_table(conn: sqlite3.Connection):
             reason   TEXT,
             noted_at TEXT
         );
+        -- Eiga.com short reviews for movies in the "电影日和" briefing section
+        -- (chain releases with no Douban score but a Japanese-audience rating).
+        -- Each row: one review. body_zh is the translated text (may be empty
+        -- if translation isn't configured / failed).
+        CREATE TABLE IF NOT EXISTS eiga_reviews (
+            movie_id   TEXT NOT NULL,
+            position   INTEGER NOT NULL,   -- 0..n-1, page order
+            review_id  TEXT,
+            rating     REAL,               -- reviewer's 1-5 score
+            title_ja   TEXT,
+            title_zh   TEXT,
+            author     TEXT,
+            date_str   TEXT,
+            body_ja    TEXT,
+            body_zh    TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (movie_id, position)
+        );
     """)
     # Add search_attempts column for existing DBs (idempotent)
     try:
@@ -226,6 +244,15 @@ def _ensure_douban_table(conn: sqlite3.Connection):
                     "new_movie_rating_at TEXT"):
         try:
             conn.execute(f"ALTER TABLE douban_matches ADD COLUMN {col_def}")
+            conn.commit()
+        except Exception:
+            pass
+    # eiga.com 1-5 rating + review count, used by the 电影日和 section.
+    # step1 also adds these, but step2 may be invoked standalone (e.g. for
+    # briefing-only runs) so we re-assert here.
+    for col_def in ("eiga_rating REAL", "eiga_rating_count INTEGER"):
+        try:
+            conn.execute(f"ALTER TABLE movies ADD COLUMN {col_def}")
             conn.commit()
         except Exception:
             pass
@@ -374,19 +401,17 @@ def match_movies(categories: tuple = ("chain", "indie"),
     bad_del = conn.execute(
         "DELETE FROM douban_matches WHERE verified = 0 AND douban_id IS NOT NULL AND douban_id != ''"
     ).rowcount
-    # Drop stale unmatched records from previous days, keep today's so this run
-    # doesn't re-search movies already attempted earlier today.
+    # Drop all unmatched records so every run re-attempts them.
+    # Skip-list entries live in douban_skip_list and are handled separately.
     stale_del = conn.execute(
-        "DELETE FROM douban_matches WHERE (douban_id IS NULL OR douban_id = '') "
-        "AND COALESCE(SUBSTR(matched_at, 1, 10), '') != ?",
-        (today_str,)
+        "DELETE FROM douban_matches WHERE (douban_id IS NULL OR douban_id = '')"
     ).rowcount
     if bad_del + stale_del:
         conn.commit()
     if bad_del:
         logger.info("Cleared %d wrong-match records for retry", bad_del)
     if stale_del:
-        logger.info("Cleared %d stale (pre-today) unmatched records for retry", stale_del)
+        logger.info("Cleared %d unmatched records for retry", stale_del)
 
     # All verified matches are skipped silently on rerun — no log, no request
     done_ids = set()
@@ -397,19 +422,6 @@ def match_movies(categories: tuple = ("chain", "indie"),
         done_ids = {r["movie_id"] for r in rows}
         if done_ids:
             logger.info("Resuming: %d already verified, skipping silently", len(done_ids))
-
-    # Movies already attempted today and unmatched — skip for the rest of today.
-    tried_today_no_match = set()
-    rows = conn.execute(
-        "SELECT movie_id FROM douban_matches "
-        "WHERE (douban_id IS NULL OR douban_id = '') "
-        "AND SUBSTR(matched_at, 1, 10) = ?",
-        (today_str,)
-    ).fetchall()
-    tried_today_no_match = {r["movie_id"] for r in rows}
-    if tried_today_no_match:
-        logger.info("Skipping %d unmatched-today movies (will retry tomorrow)",
-                    len(tried_today_no_match))
 
     # Get movies
     movies = conn.execute(
@@ -496,11 +508,6 @@ def match_movies(categories: tuple = ("chain", "indie"),
             results[cat].append(dict(mov))
             continue
 
-        # 3. Already attempted today and didn't match — skip for the rest of today
-        if mid in tried_today_no_match:
-            results[cat].append(dict(mov))
-            continue
-
         # Only movies that will actually be searched get logged
         title_jp = mov["title_jp"]
         title_jp_clean = re.sub(r'[（(]\d{4}[）)]$', '', title_jp).strip()
@@ -526,8 +533,8 @@ def match_movies(categories: tuple = ("chain", "indie"),
                                   country=mov["country"] or None)
 
             if not match:
-                # Stamp today's date so same-day reruns skip this movie.
-                # The next day's run wipes pre-today unmatched rows and re-searches.
+                # Record the attempt so the unmatched table can show it;
+                # the row is wiped at the start of the next run so it retries.
                 conn.execute(
                     """INSERT INTO douban_matches (movie_id, matched_at, verified)
                        VALUES (?, ?, 0)
@@ -537,8 +544,7 @@ def match_movies(categories: tuple = ("chain", "indie"),
                     (mid, now)
                 )
                 conn.commit()
-                tried_today_no_match.add(mid)
-                logger.info("  ❌ No Douban match (will retry tomorrow)")
+                logger.info("  ❌ No Douban match (will retry next run)")
                 results[cat].append(dict(mov))
                 continue
 
@@ -901,6 +907,109 @@ def enrich_for_briefing(top_n: int = 5, delay: float = 2.0) -> int:
     return enriched
 
 
+# Per-review body translation is capped so DeepL Free's 500K char/month budget
+# survives a few weeks of briefings. Empirically 200 chars covers the gist of
+# most eiga short reviews.
+_EIGA_REVIEW_TRANSLATE_CHARS = 200
+
+
+def enrich_eiga_reviews_for_briefing(top_n: int = 5, delay: float = 1.0) -> int:
+    """Fetch + translate the top-3 eiga.com reviews for 电影日和 candidates.
+
+    Targets are the chain releases that the briefing's 电影日和 section would
+    display: ``eiga_rating > 0``, ``douban_score`` empty, recent release.
+    Already-enriched-today candidates are skipped. Review bodies are
+    truncated to ``_EIGA_REVIEW_TRANSLATE_CHARS`` before translation so the
+    DeepL quota doesn't blow up.
+    """
+    from scraper.eiga import scrape_eiga_reviews
+    from scraper.translate import init_translator, translate_ja_to_zh, is_configured
+    from generator.briefing import select_section_movie_ids
+
+    cfg = _load_config()
+    init_translator(cfg)
+
+    conn = _get_db()
+    _ensure_douban_table(conn)
+
+    now = datetime.now().isoformat(timespec="seconds")
+    today_str = now[:10]
+
+    wanted_ids = select_section_movie_ids("电影日和", top_n=top_n)
+    if not wanted_ids:
+        logger.info("Eiga-review enrich: no 电影日和 candidates")
+        conn.close()
+        return 0
+
+    title_lookup = {}
+    placeholders = ",".join("?" for _ in wanted_ids)
+    rows = conn.execute(
+        f"SELECT movie_id, title_jp FROM movies WHERE movie_id IN ({placeholders})",
+        tuple(wanted_ids),
+    ).fetchall()
+    title_lookup = {r["movie_id"]: r["title_jp"] for r in rows}
+
+    if not is_configured():
+        logger.warning(
+            "DeepL not configured (config.yaml deepl.api_key empty) — "
+            "fetching reviews but body_zh will be empty"
+        )
+
+    enriched = 0
+    skipped_today = 0
+    for mid in wanted_ids:
+        # Skip if reviews already refreshed today (any row will do).
+        last = conn.execute(
+            "SELECT MAX(updated_at) FROM eiga_reviews WHERE movie_id=?", (mid,)
+        ).fetchone()
+        if last and last[0] and last[0][:10] == today_str:
+            skipped_today += 1
+            continue
+        try:
+            reviews = scrape_eiga_reviews(mid, n=3, delay=delay)
+        except Exception as exc:
+            logger.warning("Eiga reviews fetch failed for %s: %s", mid, exc)
+            continue
+        if not reviews:
+            logger.info("Eiga reviews: %s has no reviews", title_lookup.get(mid, mid))
+            continue
+
+        # Replace prior reviews atomically per movie.
+        conn.execute("DELETE FROM eiga_reviews WHERE movie_id=?", (mid,))
+        translated = 0
+        for pos, rev in enumerate(reviews):
+            body_ja = rev.get("body_ja") or ""
+            body_for_tx = body_ja[:_EIGA_REVIEW_TRANSLATE_CHARS]
+            body_zh = translate_ja_to_zh(body_for_tx) if body_for_tx else None
+            title_ja = rev.get("title") or ""
+            title_zh = translate_ja_to_zh(title_ja) if title_ja else None
+            if body_zh:
+                translated += 1
+            conn.execute(
+                """INSERT INTO eiga_reviews
+                   (movie_id, position, review_id, rating,
+                    title_ja, title_zh, author, date_str,
+                    body_ja, body_zh, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (mid, pos, rev.get("review_id", ""), rev.get("rating"),
+                 title_ja, title_zh or "",
+                 rev.get("author", ""), rev.get("date", ""),
+                 body_ja, body_zh or "", now),
+            )
+        conn.commit()
+        enriched += 1
+        logger.info(
+            "Eiga reviews: %s | %d reviews (%d translated)",
+            title_lookup.get(mid, mid), len(reviews), translated,
+        )
+
+    if skipped_today:
+        logger.info("Eiga-review enrich: skipped %d already-enriched today", skipped_today)
+    logger.info("Eiga-review enrich: %d/%d movies enriched", enriched, len(wanted_ids))
+    conn.close()
+    return enriched
+
+
 def enrich_new_movie_ratings(delay: float = 2.0) -> int:
     """Compute a "新片推荐度" (new-movie recommendation score) from short-review
     star ratings for movies that have a Douban match but no aggregated score yet.
@@ -1073,8 +1182,10 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
 
             # Escape pipe characters in all text fields for MD table
             _p = lambda s: str(s).replace('|', '') if s else s
+            mid_cell = (f'<a href="https://eiga.com/movie/{mid}/" target="_blank">{mid}</a>'
+                        if mid and mid != "-" else mid)
             lines.append(
-                f"| {i} | {mid} | {rank} | {_p(title)} | {_p(orig)} | {country_e} "
+                f"| {i} | {mid_cell} | {rank} | {_p(title)} | {_p(orig)} | {country_e} "
                 f"| {year_e} | {title_cn} | {score_str} | {new_movie_str} "
                 f"| {votes} | {_p(director)} | {_p(cast)} |"
             )
@@ -1103,22 +1214,40 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
         except Exception:
             skip_map = {}
 
-        um_lines = ["", "---", "", "## 未匹配（未找到豆瓣条目）", ""]
-        um_lines.append("| # | Movie ID | タイトル | カテゴリ | 状態 |")
-        um_lines.append("|---|----------|---------|----------|------|")
-        for i, m in enumerate(unmatched, 1):
-            title = str(m.get("title_jp") or "-").replace('|', '')
+        skip_rows = []
+        retry_rows = []
+        for m in unmatched:
             mid = m.get("movie_id") or "-"
+            title = str(m.get("title_jp") or "-").replace('|', '')
             cat = m.get("category") or "-"
             if mid in skip_map:
-                reason = skip_map[mid].replace('|', '')
-                status = f"Skip list（{reason}）" if reason else "Skip list"
+                skip_rows.append((mid, title, cat, skip_map[mid].replace('|', '')))
             else:
-                status = "未マッチ（再試行）"
-            um_lines.append(f"| {i} | {mid} | {title} | {cat} | {status} |")
-        # Append to file
-        with md_path.open("a", encoding="utf-8") as f:
-            f.write("\n" + "\n".join(um_lines))
+                retry_rows.append((mid, title, cat))
+
+        def _mid_link(mid: str) -> str:
+            if not mid or mid == "-":
+                return mid or "-"
+            return f'<a href="https://eiga.com/movie/{mid}/" target="_blank">{mid}</a>'
+
+        um_lines: list[str] = []
+        if skip_rows:
+            um_lines += ["", "---", "", "## Skip list", ""]
+            um_lines.append("| # | Movie ID | タイトル | カテゴリ | 理由 |")
+            um_lines.append("|---|----------|---------|----------|------|")
+            for i, (mid, title, cat, reason) in enumerate(skip_rows, 1):
+                um_lines.append(f"| {i} | {_mid_link(mid)} | {title} | {cat} | {reason} |")
+
+        if retry_rows:
+            um_lines += ["", "---", "", "## 未マッチ（再試行）", ""]
+            um_lines.append("| # | Movie ID | タイトル | カテゴリ |")
+            um_lines.append("|---|----------|---------|----------|")
+            for i, (mid, title, cat) in enumerate(retry_rows, 1):
+                um_lines.append(f"| {i} | {_mid_link(mid)} | {title} | {cat} |")
+
+        if um_lines:
+            with md_path.open("a", encoding="utf-8") as f:
+                f.write("\n" + "\n".join(um_lines))
 
     return md_path
 

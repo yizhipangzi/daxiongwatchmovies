@@ -119,6 +119,14 @@ def _get_db() -> sqlite3.Connection:
             value TEXT
         );
     """)
+    # Idempotent ALTER for eiga rating fields (added later).
+    # eiga_rating is the 1-5 average shown at the top of each movie page;
+    # eiga_rating_count is the 全N件 review count next to it.
+    for col_def in ("eiga_rating REAL", "eiga_rating_count INTEGER"):
+        try:
+            conn.execute(f"ALTER TABLE movies ADD COLUMN {col_def}")
+        except Exception:
+            pass
     conn.commit()
     return conn
 
@@ -396,8 +404,25 @@ def _scrape_movie_detail(movie_id: str, delay: float = 0.5) -> dict:
         info["year"] = int(pm.group(1))
         info["duration"] = int(pm.group(2))
         country = pm.group(3).strip()
-        if len(country) <= 20:
+        # Cap at 50 chars: long enough for 5+ country co-productions
+        # (e.g. "スペイン・オランダ・イギリス・フランス合作" is 21), but still
+        # rejects regex over-matches that bleed into adjacent page sections.
+        if len(country) <= 50:
             info["country"] = country
+
+    # eiga.com user rating (X.Y on a 5-point scale) + total review count "全N件"
+    rating_el = soup.select_one(".rating-star")
+    if rating_el:
+        try:
+            info["eiga_rating"] = float(rating_el.get_text(strip=True))
+        except ValueError:
+            pass
+    rcm = re.search(r"全(\d+)件", text)
+    if rcm:
+        try:
+            info["eiga_rating_count"] = int(rcm.group(1))
+        except ValueError:
+            pass
 
     om = _ORIG_RE.search(text)
     if om:
@@ -513,7 +538,24 @@ def scrape_movies(delay: float = 0.5) -> dict:
             "SELECT country, title_original, year, duration, release_date, director FROM movies WHERE title_jp=?",
             (title_jp,)
         ).fetchone()
-        if row:
+        # Reuse DB row only when the key fields are populated. If country or
+        # eiga_rating is missing (older step1 versions saved neither), re-fetch
+        # the detail page instead of carrying the gap forward.
+        existing_eiga_rating = None
+        existing_eiga_rating_count = None
+        try:
+            extra = conn.execute(
+                "SELECT eiga_rating, eiga_rating_count FROM movies WHERE title_jp=?",
+                (title_jp,),
+            ).fetchone()
+            if extra:
+                existing_eiga_rating, existing_eiga_rating_count = extra[0], extra[1]
+        except Exception:
+            pass
+
+        # Re-fetch if country missing OR eiga_rating never recorded (NULL).
+        # eiga_rating==0 means the page had no rating; that's a real value, not a gap.
+        if row and row[0] and existing_eiga_rating is not None:
             mov.update({
                 "country": row[0],
                 "title_original": row[1],
@@ -521,9 +563,14 @@ def scrape_movies(delay: float = 0.5) -> dict:
                 "duration": row[3],
                 "release_date": row[4],
                 "director": row[5],
+                "eiga_rating": existing_eiga_rating,
+                "eiga_rating_count": existing_eiga_rating_count,
             })
             logger.info(f"[Step1] Skipped detail for {title_jp} (reuse DB)")
         else:
+            if row:
+                missing = ("country" if not (row and row[0]) else "eiga_rating")
+                logger.info(f"[Step1] Re-fetching detail for {title_jp} ({missing} missing)")
             detail = _scrape_movie_detail(mid, delay=delay)
             mov.update(detail)
 
@@ -565,16 +612,36 @@ def scrape_movies(delay: float = 0.5) -> dict:
             conn.execute(
                 """INSERT INTO movies
                    (movie_id, title_jp, country, title_original, year,
-                    duration, release_date, director, rank, category, eiga_url)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    duration, release_date, director, rank, category, eiga_url,
+                    eiga_rating, eiga_rating_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (mid, mov["title_jp"], mov.get("country"), mov.get("title_original"),
                  mov.get("year"), mov.get("duration"), mov.get("release_date"),
-                 mov.get("director"), mov["rank"], category, mov["eiga_url"]),
+                 mov.get("director"), mov["rank"], category, mov["eiga_url"],
+                 mov.get("eiga_rating"), mov.get("eiga_rating_count")),
             )
         else:
+            # Full UPDATE so re-fetched detail (country / eiga_rating / etc.)
+            # actually lands in DB. COALESCE preserves existing values when the
+            # new fetch returned nothing for a column.
             conn.execute(
-                "UPDATE movies SET category=?, rank=? WHERE movie_id=?",
-                (category, mov["rank"], mid),
+                """UPDATE movies SET
+                       category=?, rank=?,
+                       country=COALESCE(?, country),
+                       title_original=COALESCE(?, title_original),
+                       year=COALESCE(?, year),
+                       duration=COALESCE(?, duration),
+                       release_date=COALESCE(?, release_date),
+                       director=COALESCE(?, director),
+                       eiga_rating=COALESCE(?, eiga_rating),
+                       eiga_rating_count=COALESCE(?, eiga_rating_count)
+                     WHERE movie_id=?""",
+                (category, mov["rank"],
+                 mov.get("country"), mov.get("title_original"),
+                 mov.get("year"), mov.get("duration"),
+                 mov.get("release_date"), mov.get("director"),
+                 mov.get("eiga_rating"), mov.get("eiga_rating_count"),
+                 mid),
             )
 
         # Save screenings for matching theaters (all known showing theaters)
@@ -627,6 +694,83 @@ def scrape_movies(delay: float = 0.5) -> dict:
     except Exception:
         pass
     return results
+
+
+def backfill_movie_details(category: str = "chain",
+                            only_missing: str = "eiga_rating",
+                            delay: float = 0.6,
+                            limit: int = 0) -> int:
+    """Re-scrape eiga.com detail pages for movies already in DB that are
+    missing a specific field.
+
+    Step1's main loop only touches movies that are currently in eiga.com's
+    "now showing" ranking. Movies that dropped off the ranking but still
+    showing in theaters stay in DB with whatever fields they had at scrape
+    time — useful here as a one-shot migration after new columns are added
+    (e.g. eiga_rating).
+
+    Args:
+        category: which category to backfill ("chain", "indie", or "all").
+        only_missing: column name to filter on; rows where this column IS NULL
+                      are re-scraped. Defaults to "eiga_rating".
+        delay: per-request delay (seconds).
+        limit: 0 = no limit, otherwise cap the number of movies processed.
+
+    Returns the number of movies updated.
+    """
+    conn = _get_db()
+    cat_filter = "" if category == "all" else " AND category = ?"
+    params: tuple
+    if category == "all":
+        params = ()
+    else:
+        params = (category,)
+    sql = (
+        f"SELECT movie_id, title_jp FROM movies "
+        f"WHERE {only_missing} IS NULL{cat_filter} ORDER BY rank"
+    )
+    if limit > 0:
+        sql += f" LIMIT {int(limit)}"
+    rows = conn.execute(sql, params).fetchall()
+    logger.info("Backfill %s: %d movies in %s with NULL %s",
+                only_missing, len(rows), category, only_missing)
+    updated = 0
+    for r in rows:
+        mid = r["movie_id"]
+        title_jp = r["title_jp"]
+        try:
+            detail = _scrape_movie_detail(mid, delay=delay)
+        except Exception as exc:
+            logger.warning("Backfill: detail fetch failed for %s (%s): %s",
+                           mid, title_jp, exc)
+            continue
+        if not detail:
+            continue
+        # COALESCE keeps existing data when the new fetch returned nothing.
+        conn.execute(
+            """UPDATE movies SET
+                   country=COALESCE(?, country),
+                   title_original=COALESCE(?, title_original),
+                   year=COALESCE(?, year),
+                   duration=COALESCE(?, duration),
+                   release_date=COALESCE(?, release_date),
+                   director=COALESCE(?, director),
+                   eiga_rating=COALESCE(?, eiga_rating),
+                   eiga_rating_count=COALESCE(?, eiga_rating_count)
+                 WHERE movie_id=?""",
+            (detail.get("country"), detail.get("title_original"),
+             detail.get("year"), detail.get("duration"),
+             detail.get("release_date"), detail.get("director"),
+             detail.get("eiga_rating"), detail.get("eiga_rating_count"),
+             mid),
+        )
+        conn.commit()
+        updated += 1
+        logger.info("[backfill %d/%d] %s | rating=%s",
+                    updated, len(rows), title_jp, detail.get("eiga_rating"))
+    conn.close()
+    logger.info("Backfill done: %d movies updated", updated)
+    return updated
 
 
 # ── MD出力 ───────────────────────────────────────────────────────────────────

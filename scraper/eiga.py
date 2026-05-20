@@ -101,3 +101,61 @@ def lookup_original_title(title_jp: str,
     else:
         logger.debug("eiga.com: %s has no original title (Japanese movie)", title_jp)
     return orig
+
+
+EIGA_ALL_RATING = "https://eiga.com/movie/{movie_id}/review/all-rating/"
+
+
+def scrape_eiga_reviews(movie_id: str, n: int = 3,
+                        delay: float = 1.0) -> list[dict]:
+    """Fetch the top ``n`` reviews from eiga.com's all-rating page.
+
+    Returns a list of dicts: ``{review_id, rating, title, author, date, body_ja}``.
+    Order matches the page (eiga's default sort = newest-first / featured first).
+    """
+    url = EIGA_ALL_RATING.format(movie_id=movie_id)
+    soup = _fetch(url, delay=delay)
+    if soup is None:
+        return []
+
+    results: list[dict] = []
+    for rv in soup.select(".user-review")[:n]:
+        rating_el = rv.select_one("h2.review-title .rating-star, .rating-star")
+        rating: Optional[float] = None
+        if rating_el:
+            try:
+                rating = float(rating_el.get_text(strip=True))
+            except ValueError:
+                rating = None
+        title_a = rv.select_one("h2.review-title a")
+        title_txt = title_a.get_text(strip=True) if title_a else ""
+        review_id = ""
+        if title_a and title_a.get("href"):
+            m = re.search(r"/review/(\d+)/?", title_a["href"])
+            if m:
+                review_id = m.group(1)
+        author_el = rv.select_one(".user-name")
+        author = author_el.get_text(strip=True) if author_el else ""
+        time_el = rv.select_one(".time")
+        date_str = time_el.get_text(strip=True) if time_el else ""
+        # Body lives in .txt-block p (typically p.short). Use separator='\n' so
+        # <br/> tags in the source become line breaks in the output.
+        body_el = rv.select_one(".txt-block p") or rv.select_one(".txt-block")
+        body_ja = ""
+        if body_el:
+            body_ja = clean_text(body_el.get_text(separator="\n"))
+        if not body_ja:
+            # Last-resort fallback: grab any non-trivial text in the inner div
+            inner = rv.select_one(".user-review-inner")
+            if inner:
+                body_ja = clean_text(inner.get_text(separator="\n"))[:2000]
+
+        results.append({
+            "review_id": review_id,
+            "rating": rating,
+            "title": title_txt,
+            "author": author,
+            "date": date_str,
+            "body_ja": body_ja,
+        })
+    return results

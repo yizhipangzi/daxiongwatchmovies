@@ -389,6 +389,14 @@ def main() -> None:
     logger.info("正在抽取豆瓣详细信息 (top 5 院线 + top 5 小众)...")
     enrich_for_briefing(top_n=5, delay=2.0)
 
+    # 电影日和 板块需要 eiga.com 评论 + DeepL 翻译。每天最多翻译 top-5 部电影 × 3 条评论。
+    try:
+        from pipeline.step2_douban import enrich_eiga_reviews_for_briefing
+        logger.info("正在抽取 eiga.com 短评并翻译 (电影日和 top 5)...")
+        enrich_eiga_reviews_for_briefing(top_n=5, delay=1.0)
+    except Exception as exc:
+        logger.warning("eiga 短评抽取/翻译失败 (跳过): %s", exc)
+
     logger.info("正在生成简报 Markdown...")
     if args.output:
         out_path = Path(args.output)

@@ -74,8 +74,35 @@ def cmd_skip_list(args):
         print(f"{mid}\t{noted_at}\t{reason}\t{title or '-'}")
 
 
+_NULL_SENTINELS = {"null", "none", "-", ""}
+
+
 def cmd_manual_set(args):
-    from pipeline.step2_douban import manual_set_match
+    from pipeline.step2_douban import manual_set_match, add_movie_to_skip_list
+
+    if (args.douban_id or "").strip().lower() in _NULL_SENTINELS:
+        # "this movie has no Douban entry" — drop any wrong match and put it
+        # on the skip list so future runs stop trying to re-match it.
+        movie_id = args.movie_id
+        conn = _get_db()
+        _ensure_douban_table(conn)
+        row = conn.execute("SELECT title_jp FROM movies WHERE movie_id=?", (movie_id,)).fetchone()
+        if not row:
+            conn.close()
+            print(f"❌ movie_id '{movie_id}' not found in movies table")
+            sys.exit(1)
+        title = row[0]
+        deleted = conn.execute(
+            "DELETE FROM douban_matches WHERE movie_id=?", (movie_id,)
+        ).rowcount
+        conn.commit()
+        conn.close()
+        reason = args.reason or "no-douban-entry"
+        add_movie_to_skip_list(movie_id, reason=reason)
+        print(f"✅ Marked {movie_id} ({title}) as having no Douban entry")
+        print(f"   cleared {deleted} match row | added to skip list (reason='{reason}')")
+        return
+
     try:
         r = manual_set_match(args.movie_id, args.douban_id, delay=args.delay)
         print(f"✅ {r['title_jp']}  →  {r['title_cn']}  (id={r['douban_id']})")
@@ -94,10 +121,20 @@ def main(argv=None):
     p_run.add_argument("--no-md", action="store_true", help="Do not regenerate MD")
     p_run.add_argument("--delay", type=float, default=2.0, help="Delay between requests")
 
-    p_ms = sub.add_parser("manual-set", help="Manually match a movie to a Douban subject ID")
+    p_ms = sub.add_parser(
+        "manual-set",
+        help="Manually match a movie to a Douban subject ID, or pass 'null' if Douban has no entry",
+    )
     p_ms.add_argument("movie_id", help="movie_id from the movies table")
-    p_ms.add_argument("douban_id", help="Douban subject ID (numeric part of movie URL)")
+    p_ms.add_argument(
+        "douban_id",
+        help="Douban subject ID, or 'null'/'none'/'-' to mark 'no Douban entry'",
+    )
     p_ms.add_argument("--delay", type=float, default=1.5, help="Request delay (default 1.5s)")
+    p_ms.add_argument(
+        "--reason",
+        help="Skip-list reason when douban_id is null (default: no-douban-entry)",
+    )
 
     p_skip = sub.add_parser("skip", help="Manage douban skip list")
     skip_sub = p_skip.add_subparsers(dest="op")
