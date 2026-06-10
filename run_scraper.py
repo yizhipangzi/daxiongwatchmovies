@@ -61,11 +61,15 @@ def _finish_sync(config: dict, sync_on: bool, fp_start) -> None:
         stamp = db_sync.today_jst()
         db_sync.set_cloud_stamp(stamp)
         logger.info("Sync: 写入 cloud 成功日期戳 %s", stamp)
-    if db_sync.db_fingerprint() != fp_start:
-        db_sync.push_db(config)
-        logger.info("Sync: DB 有变化，已 push 回云存储")
-    else:
-        logger.info("Sync: DB 无变化，跳过 push")
+    # push 失败（如跨境上传超时）不让整个流程崩——数据已在本地库，下次续传。
+    try:
+        if db_sync.db_fingerprint() != fp_start:
+            db_sync.push_db(config)
+            logger.info("Sync: DB 有变化，已 push 回云存储")
+        else:
+            logger.info("Sync: DB 无变化，跳过 push")
+    except Exception as exc:
+        logger.error("Sync: push 回云存储失败（数据已在本地库，下次再传）: %s", exc)
 
 
 # ── Demo / mock data ─────────────────────────────────────────────────────────

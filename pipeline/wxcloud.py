@@ -17,6 +17,11 @@ TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/token"
 UPLOAD_META_URL = "https://api.weixin.qq.com/tcb/uploadfile"
 DOWNLOAD_META_URL = "https://api.weixin.qq.com/tcb/batchdownloadfile"
 
+# 海外 VM ↔ 腾讯云存储是跨境，慢且偶发卡断。给足超时 + 重试。
+_RETRIES = 3
+_META_TIMEOUT = 30        # 申请上传/下载地址、取 token
+_TRANSFER_TIMEOUT = 300   # 实际传文件（几 MB 跨境）
+
 
 def mp_cfg(config: dict) -> dict:
     return (config or {}).get("miniprogram", {}) or {}
@@ -43,7 +48,7 @@ def get_access_token(config: dict) -> str:
         "grant_type": "client_credential",
         "appid": app_id,
         "secret": app_secret,
-    }, timeout=15)
+    }, timeout=_META_TIMEOUT)
     data = resp.json()
     token = data.get("access_token")
     if not token:
@@ -60,41 +65,61 @@ def get_access_token(config: dict) -> str:
 
 
 def upload(env: str, token: str, cloud_path: str, content: bytes) -> str:
-    """上传单个文件到云存储，返回 cloud:// file_id。"""
-    # 1. 申请上传：拿到 COS 直传地址与鉴权
-    meta = requests.post(
-        UPLOAD_META_URL, params={"access_token": token},
-        json={"env": env, "path": cloud_path}, timeout=20,
-    ).json()
-    if meta.get("errcode"):
-        raise RuntimeError(f"uploadfile 申请失败 ({cloud_path}): {meta}")
+    """上传单个文件到云存储，返回 cloud:// file_id。跨境慢/卡断时自动重试。"""
+    last = None
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            # 1. 申请上传：拿到 COS 直传地址与鉴权
+            meta = requests.post(
+                UPLOAD_META_URL, params={"access_token": token},
+                json={"env": env, "path": cloud_path}, timeout=_META_TIMEOUT,
+            ).json()
+            if meta.get("errcode"):
+                raise RuntimeError(f"uploadfile 申请失败 ({cloud_path}): {meta}")
+            # 2. 直传 COS（multipart，file 字段必须放最后）
+            form = [
+                ("key", (None, cloud_path)),
+                ("Signature", (None, meta["authorization"])),
+                ("x-cos-security-token", (None, meta["token"])),
+                ("x-cos-meta-fileid", (None, meta["cos_file_id"])),
+                ("file", ("file", content)),
+            ]
+            r = requests.post(meta["url"], files=form, timeout=_TRANSFER_TIMEOUT)
+            if r.status_code not in (200, 204):
+                raise RuntimeError(
+                    f"COS 上传失败 ({cloud_path}) HTTP {r.status_code}: {r.text[:200]}")
+            return meta["file_id"]
+        except Exception as exc:
+            last = exc
+            logger.warning("云存储上传第 %d/%d 次失败 (%s): %s",
+                           attempt, _RETRIES, cloud_path, exc)
+            if attempt < _RETRIES:
+                time.sleep(5 * attempt)
+    raise RuntimeError(f"云存储上传重试 {_RETRIES} 次仍失败 ({cloud_path}): {last}")
 
-    # 2. 直传 COS（multipart，file 字段必须放最后）
-    form = [
-        ("key", (None, cloud_path)),
-        ("Signature", (None, meta["authorization"])),
-        ("x-cos-security-token", (None, meta["token"])),
-        ("x-cos-meta-fileid", (None, meta["cos_file_id"])),
-        ("file", ("file", content)),
-    ]
-    r = requests.post(meta["url"], files=form, timeout=60)
-    if r.status_code not in (200, 204):
-        raise RuntimeError(f"COS 上传失败 ({cloud_path}) HTTP {r.status_code}: {r.text[:200]}")
-    return meta["file_id"]
 
-
-def download(env: str, token: str, fileid: str, timeout: float = 120) -> bytes:
-    """按 fileID 从云存储下载，返回字节。"""
-    meta = requests.post(
-        DOWNLOAD_META_URL, params={"access_token": token},
-        json={"env": env, "file_list": [{"fileid": fileid, "max_age": 7200}]},
-        timeout=20,
-    ).json()
-    if meta.get("errcode"):
-        raise RuntimeError(f"batchdownloadfile 失败: {meta}")
-    fl = meta.get("file_list") or []
-    if not fl or fl[0].get("status") != 0 or not fl[0].get("download_url"):
-        raise RuntimeError(f"下载地址获取失败: {meta}")
-    r = requests.get(fl[0]["download_url"], timeout=timeout)
-    r.raise_for_status()
-    return r.content
+def download(env: str, token: str, fileid: str,
+             timeout: float = _TRANSFER_TIMEOUT) -> bytes:
+    """按 fileID 从云存储下载，返回字节。跨境慢/卡断时自动重试。"""
+    last = None
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            meta = requests.post(
+                DOWNLOAD_META_URL, params={"access_token": token},
+                json={"env": env, "file_list": [{"fileid": fileid, "max_age": 7200}]},
+                timeout=_META_TIMEOUT,
+            ).json()
+            if meta.get("errcode"):
+                raise RuntimeError(f"batchdownloadfile 失败: {meta}")
+            fl = meta.get("file_list") or []
+            if not fl or fl[0].get("status") != 0 or not fl[0].get("download_url"):
+                raise RuntimeError(f"下载地址获取失败: {meta}")
+            r = requests.get(fl[0]["download_url"], timeout=timeout)
+            r.raise_for_status()
+            return r.content
+        except Exception as exc:
+            last = exc
+            logger.warning("云存储下载第 %d/%d 次失败: %s", attempt, _RETRIES, exc)
+            if attempt < _RETRIES:
+                time.sleep(5 * attempt)
+    raise RuntimeError(f"云存储下载重试 {_RETRIES} 次仍失败: {last}")
