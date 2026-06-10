@@ -349,7 +349,7 @@ def main() -> None:
         logger.info("--no-scan: 直接从本地 DB 生成 MD（不抓取）")
         # Use the helper script to generate step1/step2/step3
         try:
-            import subprocess, sys
+            import subprocess
             subprocess.run([sys.executable, "scripts/generate_md_no_scan.py"], check=True)
         except Exception as exc:
             logger.error("生成 MD 失败: %s", exc)
@@ -468,6 +468,22 @@ def main() -> None:
 
     # 本地：跑完把更新后的 DB push 回云存储（有变化才推）
     _finish_sync(config, sync_on, fp_start)
+
+    # 本地：数据已最全（含本地补的浏览器匹配）→ 顺带跑 step4，
+    # 导出 9 区 JSON 并上传云存储，直接给小程序提供数据。
+    try:
+        mp = config.get("miniprogram", {}) or {}
+        do_upload = bool(mp.get("cloud_env") and mp.get("app_secret"))
+        from pipeline import step4_export
+        logger.info("正在导出小程序 JSON（step4）%s...",
+                    "并上传云存储" if do_upload else "（仅本地，未配置上传）")
+        res = step4_export.run(config, output_dir / "miniprogram", upload=do_upload)
+        if res.get("file_ids"):
+            print(f"[OK] 小程序 JSON 已上传云存储（{len(res['file_ids'])} 个区）\n")
+        else:
+            print(f"[OK] 小程序 JSON 已生成本地（{len(res['files'])} 个）\n")
+    except Exception as exc:
+        logger.error("step4 导出失败（不影响其它产物）: %s", exc)
 
 
 if __name__ == "__main__":
