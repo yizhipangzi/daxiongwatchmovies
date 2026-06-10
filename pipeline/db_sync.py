@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import json
 import logging
 import re
 import shutil
 import sqlite3
 import tempfile
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -35,6 +37,9 @@ DB_PATH = Path("data/eiga.db")
 
 # DB 里记录「cloud VM 当天成功跑完」的日期戳（run_state 表）。本地据此门控。
 _STAMP_KEY = "cloud_last_success_date"
+# DB 里记录「本次推送版本戳」（run_state）。push 时写入并随库上传，同时单独存进
+# 云端 meta 文件；pull 先读 meta 对比本地此值，一致说明云端没更新 → 跳过下载整库。
+_PUSHED_KEY = "db_pushed_at"
 
 
 def today_jst() -> str:
@@ -104,17 +109,26 @@ def push_db(config: dict, db_path: Path = DB_PATH) -> str:
         raise RuntimeError(f"本地 DB 不存在: {db_path}")
     token = wxcloud.get_access_token(config)
     cloud_path = _cloud_db_path(config)
+    # 写入本次推送版本戳（随库上传 + 单独 meta 文件，供 pull 端先对比再决定是否下整库）
+    pushed_at = repr(time.time())
+    _set_run_state(db_path, _PUSHED_KEY, pushed_at)
     _checkpoint_wal(db_path)  # 把 WAL 合并进主库，避免漏掉最近提交
     # gzip 压缩再传：SQLite 压缩率高，几 MB 能压到几百 KB，避免 COS 因传太慢
     # 报 UserNetworkTooSlow（文件越小越快传完）。pull 端按 gzip 魔数自动解压。
     raw = Path(db_path).read_bytes()
     gz = gzip.compress(raw, compresslevel=6)
     fid = wxcloud.upload(env, token, cloud_path, gz)
+    # 极小 meta：只放版本戳。pull 端先读它对比本地，没更新就不下载整库。
+    try:
+        wxcloud.upload(env, token, cloud_path + ".meta.json",
+                       json.dumps({"pushed_at": pushed_at}).encode("utf-8"))
+    except Exception as exc:
+        logger.warning("push_db: meta 上传失败（不影响主库同步）: %s", exc)
     # 同一路径上传 file_id 稳定；首次拿到就回写 config 方便以后 pull。
     if fid and fid != _db_fileid(config):
         _save_db_fileid_to_config(fid)
-    logger.info("push_db: %s → %s (%d → %d bytes, gzip)",
-                db_path, cloud_path, len(raw), len(gz))
+    logger.info("push_db: %s → %s (%d → %d bytes, gzip, v=%s)",
+                db_path, cloud_path, len(raw), len(gz), pushed_at)
     return fid
 
 
@@ -129,6 +143,19 @@ def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
         logger.warning("pull_db: 尚无 db_fileid（先在本地跑一次 push_db 播种云端），跳过下载")
         return False
     token = wxcloud.get_access_token(config)
+
+    # 下载前先对比版本：读云端极小 meta（秒下），版本和本地一致说明云端没更新，
+    # 跳过整库下载（省跨境流量/时间）。meta 读不到（旧库/首次）就回退照常下载。
+    try:
+        meta_bytes = wxcloud.download(env, token, fileid + ".meta.json")
+        cloud_v = json.loads(meta_bytes).get("pushed_at")
+        local_v = _get_run_state(db_path, _PUSHED_KEY)
+        if cloud_v and local_v and str(cloud_v) == str(local_v):
+            logger.info("pull_db: 云端未更新（版本一致 v=%s），跳过下载", cloud_v)
+            return True
+    except Exception as exc:
+        logger.debug("pull_db: 读 meta 失败，照常下载整库: %s", exc)
+
     try:
         content = wxcloud.download(env, token, fileid)
     except Exception as exc:
@@ -157,13 +184,25 @@ def _run_state_conn(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def set_cloud_stamp(date_str: str, db_path: Path = DB_PATH) -> None:
-    """记录 cloud VM 当天成功跑完的日期戳（写进 DB 的 run_state，会随 push 同步）。"""
+def _set_run_state(db_path: Path, key: str, value: str) -> None:
     conn = _run_state_conn(db_path)
-    conn.execute("INSERT OR REPLACE INTO run_state (key, value) VALUES (?, ?)",
-                 (_STAMP_KEY, date_str))
+    conn.execute("INSERT OR REPLACE INTO run_state (key, value) VALUES (?, ?)", (key, value))
     conn.commit()
     conn.close()
+
+
+def _get_run_state(db_path: Path, key: str) -> Optional[str]:
+    if not Path(db_path).exists():
+        return None
+    conn = _run_state_conn(db_path)
+    row = conn.execute("SELECT value FROM run_state WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+
+def set_cloud_stamp(date_str: str, db_path: Path = DB_PATH) -> None:
+    """记录 cloud VM 当天成功跑完的日期戳（写进 DB 的 run_state，会随 push 同步）。"""
+    _set_run_state(db_path, _STAMP_KEY, date_str)
 
 
 def get_cloud_stamp(db_path: Path = DB_PATH) -> Optional[str]:
