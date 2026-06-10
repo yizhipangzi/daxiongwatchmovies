@@ -13,7 +13,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/token"
+# stable_token：多端/多次调用返回同一个有效 token，不会互相失效（cgi-bin/token
+# 每次取都让上一个失效，cloud VM 与本地会互相踢掉对方的 token → 40001）。
+STABLE_TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/stable_token"
 UPLOAD_META_URL = "https://api.weixin.qq.com/tcb/uploadfile"
 DOWNLOAD_META_URL = "https://api.weixin.qq.com/tcb/batchdownloadfile"
 
@@ -39,15 +41,19 @@ def get_access_token(config: dict) -> str:
     if cache_file.exists():
         try:
             c = json.loads(cache_file.read_text(encoding="utf-8"))
-            if c.get("app_id") == app_id and c.get("expire_at", 0) - 300 > time.time():
+            # 只认 stable_token 缓存；旧的 cgi-bin/token 缓存（无 kind）忽略并重取，
+            # 这样换接口后各机器自动失效旧缓存，不用手动删。
+            if (c.get("app_id") == app_id and c.get("kind") == "stable"
+                    and c.get("expire_at", 0) - 300 > time.time()):
                 return c["access_token"]
         except Exception:
             pass
 
-    resp = requests.get(TOKEN_URL, params={
+    resp = requests.post(STABLE_TOKEN_URL, json={
         "grant_type": "client_credential",
         "appid": app_id,
         "secret": app_secret,
+        "force_refresh": False,
     }, timeout=_META_TIMEOUT)
     data = resp.json()
     token = data.get("access_token")
@@ -56,6 +62,7 @@ def get_access_token(config: dict) -> str:
     try:
         cache_file.write_text(json.dumps({
             "app_id": app_id,
+            "kind": "stable",
             "access_token": token,
             "expire_at": time.time() + int(data.get("expires_in", 7200)),
         }, ensure_ascii=False), encoding="utf-8")
