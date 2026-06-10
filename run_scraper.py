@@ -36,11 +36,36 @@ from generator.briefing import generate_wechat_briefing_md
 from pipeline.step1_eiga import register_theaters, scrape_movies
 from pipeline.step2_douban import enrich_for_briefing
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+from scraper.logging_setup import setup as _setup_logging
+_setup_logging()  # local=仅控制台；cloud=另写 logs/当天.log，只留 2 天
 logger = logging.getLogger("run_scraper")
+
+
+# ── 云存储同步 ────────────────────────────────────────────────────────────────
+
+def _sync_enabled(config: dict) -> bool:
+    """miniprogram.cloud_env + db_fileid 都配齐才同步（首次需先 run_db_sync.py --push）。"""
+    mp = config.get("miniprogram", {}) or {}
+    return bool(mp.get("cloud_env") and mp.get("db_fileid"))
+
+
+def _finish_sync(config: dict, sync_on: bool, fp_start) -> None:
+    """结束时：cloud 写当天成功日期戳；DB 有变化才 push 回云存储。"""
+    if not sync_on:
+        return
+    from scraper import fetcher
+    from pipeline import db_sync
+    if fetcher.is_cloud():
+        # cloud 跑完即写当天日期戳放行本地——即使被豆瓣限流中断也写：
+        # 本地正是为了接手 cloud 没做完的豆瓣匹配（浏览器硬骨头）而存在的。
+        stamp = db_sync.today_jst()
+        db_sync.set_cloud_stamp(stamp)
+        logger.info("Sync: 写入 cloud 成功日期戳 %s", stamp)
+    if db_sync.db_fingerprint() != fp_start:
+        db_sync.push_db(config)
+        logger.info("Sync: DB 有变化，已 push 回云存储")
+    else:
+        logger.info("Sync: DB 无变化，跳过 push")
 
 
 # ── Demo / mock data ─────────────────────────────────────────────────────────
@@ -330,12 +355,35 @@ def main() -> None:
             logger.error("生成 MD 失败: %s", exc)
         return
 
+    # 同步状态（demo 不同步）
+    sync_on = False
+    fp_start = None
+
     if args.demo:
         logger.info("=== 演示模式：使用本地演示数据 ===")
         schedules = _load_demo_data()
     else:
+        # ── 同步：开始先 pull 最新 eiga.db；本地必须等 cloud 当天已成功 ──────
+        from scraper import fetcher as _fetcher
+        from pipeline import db_sync as _dbsync
+        sync_on = _sync_enabled(config)
+        if sync_on:
+            logger.info("Sync: 从云存储拉取最新 eiga.db ...")
+            _dbsync.pull_db(config)
+            if not _fetcher.is_cloud():
+                stamp = _dbsync.get_cloud_stamp()
+                today_j = _dbsync.today_jst()
+                if stamp != today_j:
+                    logger.error("本地中止：cloud VM 今天(%s)尚未成功跑完（DB 标记=%s）",
+                                 today_j, stamp)
+                    print(f"\n[ERROR] cloud VM 今天({today_j})还没跑成功"
+                          f"（数据库标记={stamp}）——本地不执行，"
+                          f"请等 cloud 凌晨任务完成后再跑。\n")
+                    sys.exit(1)
+            fp_start = _dbsync.db_fingerprint()
+
         # Use eiga.com pipeline only: register theaters and scrape now-showing movies
-        theaters = register_theaters(delay=0.3)
+        register_theaters(delay=0.3)
         results = scrape_movies(delay=0.3)
 
         # Convert scraped results into MovieInfo list
@@ -366,8 +414,11 @@ def main() -> None:
         step2_results = None
         if not args.no_douban:
             from pipeline.step2_douban import match_movies, generate_step2_md
+            from scraper import fetcher
             step2_results = match_movies(categories=("chain", "indie"), delay=5.0, resume=True)
-            generate_step2_md(step2_results)
+            # cloud 环境只为小程序填库，不生成 step2 MD。
+            if not fetcher.is_cloud():
+                generate_step2_md(step2_results)
 
         if not all_movies:
             logger.warning("未抓取到任何排期数据。使用演示数据代替。")
@@ -383,6 +434,14 @@ def main() -> None:
             schedules = [merged]
 
     # ── Generate ─────────────────────────────────────────────────────────────
+    # cloud 只为小程序填库（step1 抓取 + step2 匹配），不生成公众号简报。
+    from scraper import fetcher
+    if fetcher.is_cloud():
+        logger.info("[cloud] 跳过公众号简报生成（cloud 只负责填库）")
+        _finish_sync(config, sync_on, fp_start)  # 写日期戳 + push
+        print("\n[OK] cloud 抓取/匹配完成（未生成简报）\n")
+        return
+
     # WeChat 公众号 briefing: 院線映画 + 小众映画 (top 5 each, douban_score > 0).
     # Enrich first so douban_details has director/cast/genre/want/watched/reviews
     # with reviewer IDs, then render the final MD.
@@ -406,6 +465,9 @@ def main() -> None:
 
     logger.info("简报已保存: %s", out_path)
     print(f"\n[OK] 简报已生成: {out_path}\n")
+
+    # 本地：跑完把更新后的 DB push 回云存储（有变化才推）
+    _finish_sync(config, sync_on, fp_start)
 
 
 if __name__ == "__main__":

@@ -238,6 +238,15 @@ def _refresh_session_cookie() -> bool:
     Returns True if a logged-in cookie (dbcl2) was obtained.
     """
     global _session
+    # cloud（无头 VM）：没有浏览器/本地 profile，且 get_douban_cookie 会试图重启真 Chrome，
+    # 在 VM 上毫无意义。直接返回 False → 调用方抛 CookieExpiredError 干净停下，下次续跑。
+    try:
+        from scraper import fetcher
+        if fetcher.is_cloud():
+            logger.info("cloud: 跳过浏览器 cookie 刷新（VM 无浏览器，硬匹配留给本地）")
+            return False
+    except Exception:
+        pass
     try:
         from .browser_cookie import (
             get_douban_cookie_from_playwright_profile,
@@ -289,20 +298,25 @@ def _douban_get(url: str, params: Optional[dict] = None,
     On 403/429: tries a one-shot cookie refresh, then raises CookieExpiredError
     immediately — no point burning more retries with a blocked session.
     """
+    # 走统一 fetcher（节流/抖动/可选 Oracle VM 中继换 IP）。传 session 以保留 cookie /
+    # curl_cffi TLS 指纹；cooldown=False，因为豆瓣各 enrich 函数已有自己的退避 tracker。
+    from . import fetcher
     sess = _get_session()
     wait = delay
     for attempt in range(1, retries + 1):
         base = wait if attempt > 1 else delay
-        time.sleep(base + random.uniform(0.4, max(1.0, base * 0.5)))
+        eff = max(base, fetcher.base_delay())
         try:
-            resp = sess.get(url, params=params, timeout=15)
+            resp = fetcher.get(url, params=params, session=sess, delay=eff)
+            if resp is None:
+                raise requests.RequestException("fetcher returned None")
             if resp.status_code in (403, 429):
                 logger.warning("Douban %d for %s — attempting cookie refresh",
                                resp.status_code, url)
                 if _refresh_session_cookie():
                     sess = _get_session()        # updated cookies
-                    resp2 = sess.get(url, params=params, timeout=15)
-                    if resp2.status_code not in (403, 429):
+                    resp2 = fetcher.get(url, params=params, session=sess, delay=eff)
+                    if resp2 is not None and resp2.status_code not in (403, 429):
                         resp2.raise_for_status()
                         return resp2
                 raise CookieExpiredError(
@@ -1010,6 +1024,16 @@ def search_douban(title_jp: str, year: int = 0,
                 return result
 
     # Final fallback: Playwright-rendered browser search.
+    # ⚠️ cloud（无头 VM、cron 无人值守）下**禁用**：Playwright 会开可见浏览器且
+    # 遇豆瓣人机验证要人工通过——VM 上必然卡住超时。这类硬匹配留给本地有人时跑。
+    try:
+        from scraper import fetcher
+        if fetcher.is_cloud():
+            logger.info("Douban: cloud 环境跳过 Playwright 搜索（硬匹配留给本地）")
+            return None
+    except Exception:
+        pass
+
     # Douban's search page is JS-rendered; requests gets empty HTML for some
     # queries. Playwright actually executes the JS and sees real results.
     # Only triggered once per movie after all requests paths fail.
@@ -1188,40 +1212,6 @@ def _find_youtube_trailer(soup: BeautifulSoup) -> str:
         if "youtube.com/watch" in href or "youtu.be/" in href:
             return href
     return ""
-
-
-def fetch_short_review_ratings(subject_id: str, delay: float = 1.5) -> list[int]:
-    """Fetch star ratings from the 'want to watch' (status=P) comments page.
-
-    Used for movies that have a Douban entry but no aggregated score yet —
-    early viewer star ratings (1-5) give a recommendation signal.
-
-    Returns a list of integer ratings (1-5) found on the first page. Empty list
-    if the page cannot be fetched or no rated reviews are present.
-    """
-    url = f"{MOVIE_BASE}/{subject_id}/comments?status=P"
-    sess = _get_session()
-    prev_referer = sess.headers.get("Referer", "https://movie.douban.com/")
-    sess.headers["Referer"] = f"{MOVIE_BASE}/{subject_id}/"
-    try:
-        resp = _douban_get(url, delay=delay)
-    finally:
-        sess.headers["Referer"] = prev_referer
-    if resp is None:
-        return []
-    soup = BeautifulSoup(resp.text, "lxml")
-    ratings: list[int] = []
-    # Each comment block has <span class="comment-info">…<span class="allstarN0 rating">…
-    for info in soup.select(".comment-info"):
-        rating_span = info.select_one("span[class*='allstar']")
-        if not rating_span:
-            continue
-        for cls in rating_span.get("class") or []:
-            m = re.match(r"allstar([1-5])0$", cls)
-            if m:
-                ratings.append(int(m.group(1)))
-                break
-    return ratings
 
 
 def _parse_short_reviews(soup: BeautifulSoup, n: int = 5) -> list[str]:

@@ -1,97 +1,62 @@
 # 大熊看点映 — 东京电影简报配置文件
 # ============================================================
-# 复制此文件为 config.yaml 并按需修改
-# ============================================================
-
-# ── 影院配置 ────────────────────────────────────────────────
-theaters:
-
-  # TOHOシネマズ（东宝连锁影院）
-  toho:
-    enabled: true
-    base_url: "https://hlo.tohotheater.jp"
-    # 东京都内主要 TOHO 影院列表
-    locations:
-      - id: "076"
-        name: "TOHOシネマズ 日比谷"
-      - id: "036"
-        name: "TOHOシネマズ 新宿"
-      - id: "013"
-        name: "TOHOシネマズ 渋谷"
-      - id: "014"
-        name: "TOHOシネマズ 六本木ヒルズ"
-      - id: "043"
-        name: "TOHOシネマズ 池袋"
-      - id: "024"
-        name: "TOHOシネマズ 上野"
-
-  # ユナイテッド・シネマ（United Cinemas 连锁）
-  united:
-    enabled: true
-    base_url: "https://www.unitedcinemas.jp"
-    locations:
-      - id: "toyosu"
-        name: "ユナイテッド・シネマ 豊洲"
-      - id: "urawamisono"
-        name: "ユナイテッド・シネマ 浦和美園"
-
-  # 独立/艺术影院（可自行增删）
-  independent:
-    enabled: true
-    locations:
-      - name: "Uplink 吉祥寺"
-        url: "https://jk.uplink.co.jp"
-        schedule_path: "/schedule/"
-      - name: "シアター・イメージフォーラム"
-        url: "https://www.imageforum.co.jp"
-        schedule_path: "/theatre/now_showing.html"
-      - name: "シネマヴェーラ渋谷"
-        url: "https://www.cinemavera.com"
-        schedule_path: "/"
-      - name: "ポレポレ東中野"
-        url: "https://pole2.co.jp"
-        schedule_path: "/"
-      - name: "ケイズシネマ"
-        url: "https://www.ks-cinema.com"
-        schedule_path: "/"
-      - name: "早稲田松竹"
-        url: "https://wasedashochiku.co.jp"
-        schedule_path: "/"
-
-  # Grand Cinema Sunshine 连锁影院
-  grandcinema:
-    enabled: true
-    base_url: "https://www.cinemasunshine.co.jp"
-    locations:
-      - id: "gdcs"
-        name: "グランドシネマサンシャイン 池袋"
-      - id: "ikebukuro"
-        name: "シネマサンシャイン 池袋"
-      - id: "heiwajima"
-        name: "シネマサンシャイン 平和島"
-
 # ── 豆瓣配置 ─────────────────────────────────────────────────
 douban:
   # 豆瓣搜索基础 URL（无需 API key，使用网页爬取）
   search_url: "https://movie.douban.com/j/subject_suggest"
   movie_base_url: "https://movie.douban.com/subject"
   # 请求间隔（秒），避免被封
-  request_delay: 1.5
+  request_delay: 3.0
   # 最低评分门槛（低于此分数的电影不纳入推荐）
   min_score_threshold: 0.0
   # 每部电影抓取的短评数量
   short_review_count: 5
   # ── 反爬配置（参考 GitHub 开源豆瓣爬虫最佳实践） ──
-  # 浏览器登录豆瓣后复制 Cookie 贴到此处（大幅降低被 403 的概率）
-  # 获取方式：浏览器打开 movie.douban.com → F12 → Network → 刷新 → 点任意请求 → 复制 Request Headers 中的 Cookie
-  cookie: ""
+  # Cookie 配置，三种模式：
+  #   auto   — 自动从本地 Chrome/Edge 浏览器读取（推荐，需先在浏览器登录豆瓣）
+  #   ""     — 留空，同 auto
+  #   '...'  — 手动粘贴 Cookie 字符串（用单引号包裹，因为 Cookie 内含双引号）
+  cookie: ''
+  # Playwright 搜索使用的 Chrome profile 名称（Chrome User Data 目录下的子目录名）
+  # 例如 "Default" 等。留空则用不带 profile 的新 context。
+  chrome_profile: ""
   # HTTP 代理（可选），格式如 http://127.0.0.1:7890
   proxy: ""
+
+# ── 抓取/反爬配置（step1 eiga + step2/3 豆瓣 的网络请求） ──────────
+# environment:
+#   local — 本机直连抓取（默认，行为同以前，延时较短）
+#   cloud — 经 Oracle Cloud VM 上的抓取中继(fetch-relay)出口抓取，延时拉长、
+#           反爬更激进，适合放免费云无人值守跑。
+# fetch_via:
+#   direct — 直连目标站
+#   relay  — 走 Oracle VM 中继（换 IP 对付反爬，需先按 deploy/fetch-relay/ 部署）
+# environment=cloud 时 fetch_via 自动按 relay 处理（除非显式指定 direct）。
+scraper:
+  environment: "cloud"          # local | cloud
+  fetch_via: ""                 # "" 按 environment 推断 / direct / relay
+  relay_url: ""                 # Oracle VM 中继地址，如 http://<VM公网IP>:8080
+  relay_token: ""               # 与中继端 PROXY_TOKEN 一致的密钥
+  proxy: ""                     # 可选 HTTP 代理，如 http://127.0.0.1:7890
+  # 基础请求延时（秒）。cloud 比 local 长，对付反爬。
+  delay_local: 0.3
+  delay_cloud: 2.5
+  # 每次请求在基础延时上叠加的随机抖动区间（秒）
+  jitter: [0.4, 1.5]
+  # 每隔 N 次请求插入一段更长的“喘息”停顿（0=关闭）
+  breath_every: 20
+  breath_range: [12, 30]
+  # 连续失败达到阈值后冷却一段时间；冷却次数用尽则本轮停止（等下次续跑）
+  cooldown_threshold: 4
+  cooldown_range: [45, 90]
+  max_cooldowns: 3
+  # User-Agent 轮换池为空则用内置池
+  user_agents: []
 
 # ── DeepL 翻译（电影日和 板块的日语短评翻译成中文） ────────────────
 deepl:
   # DeepL API key.
-  # Free 方案 (https://www.deepl.com/pro-api) key 以 ":fx" 结尾，每月 500k 字。
+  # Free 方案 key 以 ":fx" 结尾，每月 500k 字。
   # 留空则跳过翻译，简报里原文显示。
   api_key: ""
   # 目标语言：ZH（简体）/ ZH-HANS / ZH-HANT（繁体）
@@ -119,7 +84,7 @@ generator:
   # 简报标题模板（支持 {week_start} {week_end} {issue_number} 占位符）
   title_template: "大熊看点映 第{issue_number}期｜{week_start} ~ {week_end}"
   # 副标题
-  subtitle: "东京华人电影周报"
+  subtitle: "东京电影周报"
   # 推荐榜显示数量
   top_n: 10
   # 是否包含下周预告
@@ -127,11 +92,29 @@ generator:
   # 每部电影的短评显示条数
   reviews_to_show: 3
 
+# ── 微信小程序配置（step4：导出 JSON + 上传云开发云存储） ──────────
+# 注意：小程序与公众号是两个不同的 App，凭据不同。
+#   app_id     小程序 AppID（project.config.json 里那个，wx 开头）
+#   app_secret 小程序 AppSecret（小程序管理后台 → 开发管理 → 开发设置获取）
+#   cloud_env  云开发环境 ID（开发者工具开通云开发后得到，如 "prod-xxxx"）
+#   storage_prefix 云存储里的路径前缀（小程序按此前缀下载，如 data/shibuya.json）
+miniprogram:
+  app_id: ""
+  app_secret: ""
+  cloud_env: ""
+  storage_prefix: "data"
+  # 同步中枢：整个 sqlite 当一个文件存在云存储这个路径下。
+  # VM/本地/step4 都「先 pull eiga.db → 干活 → push eiga.db」。
+  db_path: "db/eiga.db"
+  # 由 run_db_init.py 初始化后自动填入（pull 下载时用）。
+  db_fileid: ""
+  token_cache_file: ".miniprogram_token_cache.json"
+
 # ── 微信公众号配置 ────────────────────────────────────────────
 wechat:
   # 填写你的公众号 AppID 和 AppSecret
-  app_id: "YOUR_WECHAT_APP_ID"
-  app_secret: "YOUR_WECHAT_APP_SECRET"
+  app_id: ""
+  app_secret: ""
   # Token 缓存文件（自动生成，无需手动填写）
   token_cache_file: ".wechat_token_cache.json"
   # 草稿作者

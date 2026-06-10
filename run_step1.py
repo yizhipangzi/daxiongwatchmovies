@@ -1,14 +1,11 @@
 """Run Step 1: register theaters + scrape now-showing movies from eiga.com only."""
 import sys
-import logging
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+from scraper.logging_setup import setup as _setup_logging
+_setup_logging()  # local=仅控制台；cloud=另写 logs/当天.log，只留 2 天
 
 from pipeline.step1_eiga import register_theaters, scrape_movies, generate_step1_md
 

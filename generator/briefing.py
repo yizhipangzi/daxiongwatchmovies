@@ -33,7 +33,6 @@ from .briefing_template import (
     SECTION_EMPTY_PLACEHOLDER,
     MOVIE_BLOCK,
     STATS_WITH_SCORE,
-    STATS_WITH_NEW_RATING,
     STATS_NO_DATA,
     STATS_WITH_EIGA_RATING,
     REVIEW_LINE,
@@ -86,14 +85,7 @@ def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str],
         if score:
             stats_line = STATS_WITH_SCORE.format(score=score, watched=watched, want=want)
         else:
-            nm_rating = m.get("new_movie_rating")
-            nm_count = m.get("new_movie_rating_count") or 0
-            if nm_rating:
-                stats_line = STATS_WITH_NEW_RATING.format(
-                    rating=nm_rating, count=nm_count, watched=watched, want=want,
-                )
-            else:
-                stats_line = STATS_NO_DATA.format(watched=watched, want=want)
+            stats_line = STATS_NO_DATA.format(watched=watched, want=want)
 
     director = (m.get("director") or EMPTY_FIELD).strip() or EMPTY_FIELD
     cast = (m.get("cast") or EMPTY_FIELD).strip() or EMPTY_FIELD
@@ -276,6 +268,7 @@ _SECTION_SPECS: dict[str, dict] = {
             m.get("category") == "chain"
             and (m.get("douban_score") or 0) == 0
             and (m.get("eiga_rating") or 0) > 0
+            and (m.get("eiga_rating_count") or 0) > 50
             and _is_recent_release(m, today, days=365)
             and _year_diff(m, today) <= 3
         ),
@@ -298,7 +291,6 @@ def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
         "       mv.eiga_rating, mv.eiga_rating_count, "
         "       m.douban_id, m.douban_url, m.title_cn AS m_title_cn, "
         "       m.douban_score AS m_score, m.douban_year, "
-        "       m.new_movie_rating, m.new_movie_rating_count, "
         "       d.title_cn AS d_title_cn, d.douban_score AS d_score, "
         "       d.douban_votes, d.director, d.cast, d.genre, "
         "       d.want_to_watch, d.watched, d.short_reviews "

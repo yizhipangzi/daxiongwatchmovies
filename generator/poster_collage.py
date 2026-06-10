@@ -44,7 +44,6 @@ COLLAGE_DIR = Path("output") / "collages"
 _SECTION_SLUGS: dict[str, str] = {
     "院线热映": "chain_hot",
     "院线经典": "chain_classic",
-    "院线新片": "chain_new",
     "电影日和": "chain_eiga",
     "小众佳片": "indie",
 }

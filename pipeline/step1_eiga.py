@@ -106,6 +106,17 @@ def _get_db() -> sqlite3.Connection:
             FOREIGN KEY (movie_id) REFERENCES movies(movie_id),
             FOREIGN KEY (theater_id) REFERENCES theaters(theater_id)
         );
+        CREATE TABLE IF NOT EXISTS showtimes (
+            movie_id   TEXT NOT NULL,
+            theater_id TEXT NOT NULL,
+            show_date  TEXT NOT NULL,   -- ISO date "2026-06-06"
+            start_time TEXT NOT NULL,   -- "HH:MM" 24h, zero-padded
+            end_time   TEXT,            -- "HH:MM" or NULL
+            ticket_url TEXT,            -- 予約リンク or NULL (満席/上映終了 etc.)
+            PRIMARY KEY (movie_id, theater_id, show_date, start_time),
+            FOREIGN KEY (movie_id) REFERENCES movies(movie_id),
+            FOREIGN KEY (theater_id) REFERENCES theaters(theater_id)
+        );
         CREATE TABLE IF NOT EXISTS movie_snapshots (
             snapshot_date TEXT NOT NULL,
             rank INTEGER NOT NULL,
@@ -122,7 +133,11 @@ def _get_db() -> sqlite3.Connection:
     # Idempotent ALTER for eiga rating fields (added later).
     # eiga_rating is the 1-5 average shown at the top of each movie page;
     # eiga_rating_count is the 全N件 review count next to it.
-    for col_def in ("eiga_rating REAL", "eiga_rating_count INTEGER"):
+    # script = 脚本 (screenwriters, " / " joined); cast_names = 出演者 (actor
+    # names, " / " joined — `cast` is a SQL keyword so the column is cast_names).
+    # director (監督) column already exists above.
+    for col_def in ("eiga_rating REAL", "eiga_rating_count INTEGER",
+                    "script TEXT", "cast_names TEXT"):
         try:
             conn.execute(f"ALTER TABLE movies ADD COLUMN {col_def}")
         except Exception:
@@ -132,18 +147,32 @@ def _get_db() -> sqlite3.Connection:
 
 
 def _fetch(url: str, delay: float = 0.5, max_retries: int = 3) -> Optional[BeautifulSoup]:
+    """抓取 eiga 页面。走统一 fetcher（节流/抖动/UA 轮换/可选 Oracle VM 中继/退避冷却）。
+
+    fetcher 冷却用尽（exhausted）时直接返回 None，让调用方据此停下续跑。
+    """
+    from scraper import fetcher
+    # delay=0：把基础延时交给 fetcher 按 environment 决定（local/cloud），
+    # 但若调用方显式传了更大的 delay 则尊重之。
+    base = max(delay, fetcher.base_delay())
     for attempt in range(1, max_retries + 1):
-        time.sleep(delay)
-        try:
-            resp = requests.get(url, headers=_HEADERS, timeout=15)
-            resp.raise_for_status()
-            resp.encoding = "utf-8"
-            return BeautifulSoup(resp.text, "lxml")
-        except Exception as exc:
-            logger.warning("fetch failed (attempt %d/%d) (%s): %s",
-                           attempt, max_retries, url, exc)
-            if attempt < max_retries:
-                time.sleep(2 * attempt)
+        if fetcher.exhausted():
+            return None
+        # 不传 User-Agent，让 fetcher 从 UA 池轮换（对付反爬）；只保留语言头。
+        hdrs = {k: v for k, v in _HEADERS.items() if k.lower() != "user-agent"}
+        resp = fetcher.get(url, headers=hdrs, delay=base if attempt == 1 else delay,
+                           cooldown=True)
+        if resp is not None:
+            try:
+                if resp.status_code < 400:
+                    resp.encoding = "utf-8"
+                    return BeautifulSoup(resp.text, "lxml")
+                logger.warning("fetch %s -> HTTP %s (attempt %d/%d)",
+                               url, resp.status_code, attempt, max_retries)
+            except Exception as exc:
+                logger.warning("fetch parse failed (%s): %s", url, exc)
+        if attempt < max_retries:
+            time.sleep(2 * attempt)
     return None
 
 
@@ -389,8 +418,30 @@ def _scrape_now_showing(delay: float = 0.5) -> list[dict]:
     return movies
 
 
+def _staff_names(soup: BeautifulSoup, label: str) -> list[str]:
+    """Return the people listed under a given <dt> label in <dl class="movie-staff">.
+
+    The staff block is a definition list: each <dt> is a role (監督 / 脚本 / 撮影 …)
+    followed by one or more <dd> entries until the next <dt>.
+    """
+    dl = soup.select_one("dl.movie-staff")
+    if dl is None:
+        return []
+    names: list[str] = []
+    current: Optional[str] = None
+    for child in dl.find_all(["dt", "dd"]):
+        if child.name == "dt":
+            current = child.get_text(strip=True)
+        elif current == label:
+            name = child.get_text(strip=True)
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
 def _scrape_movie_detail(movie_id: str, delay: float = 0.5) -> dict:
-    """Fetch movie detail page, extract country/original title/year/duration/release/director."""
+    """Fetch movie detail page, extract country/original title/year/duration/
+    release/director/script/cast."""
     url = f"https://eiga.com/movie/{movie_id}/"
     soup = _fetch(url, delay=delay)
     if soup is None:
@@ -398,6 +449,24 @@ def _scrape_movie_detail(movie_id: str, delay: float = 0.5) -> dict:
 
     text = soup.get_text()
     info: dict = {}
+
+    # 監督 (director) / 脚本 (script) from the staff definition list, and 出演者
+    # (cast) from <ul class="movie-cast">. Cast actor name lives in the <span>
+    # of each <li> (the surrounding text is the character/role name).
+    director = _staff_names(soup, "監督")
+    if director:
+        info["director"] = " / ".join(director)
+    script = _staff_names(soup, "脚本")
+    if script:
+        info["script"] = " / ".join(script)
+    cast = [
+        li.select_one("span").get_text(strip=True)
+        for li in soup.select("ul.movie-cast > li")
+        if li.select_one("span")
+    ]
+    if cast:
+        # Cap at 10 to keep the field compact for the briefing / mini-program popup.
+        info["cast"] = " / ".join(cast[:10])
 
     pm = _PROD_RE.search(text)
     if pm:
@@ -410,19 +479,32 @@ def _scrape_movie_detail(movie_id: str, delay: float = 0.5) -> dict:
         if len(country) <= 50:
             info["country"] = country
 
-    # eiga.com user rating (X.Y on a 5-point scale) + total review count "全N件"
+    # eiga.com user rating (X.Y on a 5-point scale) + total rating count.
+    # The rating count comes from the .all-reviews-link tag (e.g.
+    # "全123件") — this is the number of users who actually rated the
+    # film, which the briefing uses as a credibility threshold. The
+    # bare-text regex is a fallback for pages where the link's markup varies.
     rating_el = soup.select_one(".rating-star")
     if rating_el:
         try:
             info["eiga_rating"] = float(rating_el.get_text(strip=True))
         except ValueError:
             pass
-    rcm = re.search(r"全(\d+)件", text)
-    if rcm:
-        try:
-            info["eiga_rating_count"] = int(rcm.group(1))
-        except ValueError:
-            pass
+    link_el = soup.select_one(".all-reviews-link")
+    if link_el:
+        lm = re.search(r"(\d+)", link_el.get_text())
+        if lm:
+            try:
+                info["eiga_rating_count"] = int(lm.group(1))
+            except ValueError:
+                pass
+    if "eiga_rating_count" not in info:
+        rcm = re.search(r"全(\d+)件", text)
+        if rcm:
+            try:
+                info["eiga_rating_count"] = int(rcm.group(1))
+            except ValueError:
+                pass
 
     om = _ORIG_RE.search(text)
     if om:
@@ -458,12 +540,91 @@ def _scrape_theater_list(movie_id: str, delay: float = 0.5) -> list[str]:
     return theater_ids
 
 
-def scrape_movies(delay: float = 0.5) -> dict:
+_TIME_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})")
+
+
+def _norm_time(raw: str) -> Optional[str]:
+    """Normalize a leading 'H:MM' / 'HH:MM' to zero-padded 'HH:MM'."""
+    m = _TIME_RE.match(raw or "")
+    if not m:
+        return None
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def _scrape_showtimes(movie_id: str, theater_id: str, delay: float = 0.5) -> list[dict]:
+    """Fetch the per-theater schedule page and parse the weekly showtimes.
+
+    URL: /movie-theater/{movie_id}/{theater_id}/ where theater_id is the
+    "pref/area/theater" path (e.g. "13/130201/3318").
+
+    The schedule is a <table class="weekly-schedule"> whose <td data-date="YYYYMMDD">
+    cells each hold one day's screenings. Every showtime is a `.btn` element:
+      - <a class="btn ticket…" href="…">14:55<small>～23:35</small></a>  (bookable)
+      - <span class="btn off">9:40</span>                               (no link)
+    The leading text is the start time; the optional <small> holds the end time.
+
+    Returns a list of dicts: {show_date, start_time, end_time, ticket_url}.
+    """
+    url = f"https://eiga.com/movie-theater/{movie_id}/{theater_id}/"
+    soup = _fetch(url, delay=delay)
+    if soup is None:
+        return []
+
+    showtimes: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for td in soup.select("table.weekly-schedule td[data-date]"):
+        d = td.get("data-date", "")
+        if len(d) != 8 or not d.isdigit():
+            continue
+        show_date = f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+        for btn in td.select(".btn"):
+            # The start time is the leading text node, before any <small> end time.
+            lead = btn.find(string=True)
+            start = _norm_time(lead.strip() if lead else "")
+            if not start:
+                continue
+            # Dedup within a theater/day: the same slot can appear twice
+            # (e.g. 字幕 row + 吹替 row collapse to identical start times).
+            key = (show_date, start)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            end = None
+            small = btn.select_one("small")
+            if small:
+                end = _norm_time(re.sub(r"^[～~\s]+", "", small.get_text(strip=True)))
+            href = btn.get("href")
+            showtimes.append({
+                "show_date": show_date,
+                "start_time": start,
+                "end_time": end,
+                "ticket_url": href if href else None,
+            })
+    return showtimes
+
+
+def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
     """操作2: Scrape ALL now-showing movies, classify as chain/indie/other.
+
+    Args:
+        delay: per-request delay (seconds).
+        scrape_showtimes: also fetch each movie's per-theater weekly schedule and
+            store it in the `showtimes` table. Adds one request per (movie, theater),
+            so it can be disabled for a fast metadata-only run.
 
     Returns dict with keys: "chain", "indie", "other" — each a list of movie dicts.
     """
     conn = _get_db()
+
+    # 清理过期排片：删除「处理日前一天」之前的旧场次（JST）。在映电影的场次每轮会
+    # 先删后写保持最新，但下线电影（不再被抓取）的旧场次会残留，这里统一清掉。
+    from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
+    _cutoff = (_dt2.now(_tz2(_td2(hours=9))).date() - _td2(days=1)).isoformat()
+    _purged = conn.execute("DELETE FROM showtimes WHERE show_date < ?", (_cutoff,)).rowcount
+    conn.commit()
+    if _purged:
+        logger.info("Step1: 清理 %d 条 %s 之前的过期排片", _purged, _cutoff)
 
     # Get theater sets by chain membership. Definition: any theater with a non-empty
     # 'chain' field is considered a chain theater. Any theater not in chain_tids is
@@ -523,9 +684,25 @@ def scrape_movies(delay: float = 0.5) -> dict:
         # If state check fails, proceed normally
         pass
 
+    # 新一轮：清零 fetcher 的请求计数/冷却状态
+    from scraper import fetcher
+    fetcher.reset_state()
+
     logger.info("Scraping now-showing movies...")
     movies = _scrape_now_showing(delay=delay)
     logger.info("Found %d movies in ranking", len(movies))
+
+    # 断点续跑：本轮（今天 JST）已写过快照的电影视为「已抓完」，直接跳过重抓。
+    # 每部抓完会立刻 commit + 写快照（见循环末尾），所以被中途杀掉后重跑只补未完成的。
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _tdj
+    today_jst = _dt.now(_tz(_tdj(hours=9))).date().isoformat()
+    done_today = {
+        r["movie_id"] for r in conn.execute(
+            "SELECT movie_id FROM movie_snapshots WHERE snapshot_date=?", (today_jst,)
+        ).fetchall()
+    }
+    if done_today:
+        logger.info("Step1 续跑：今天已抓完 %d 部，将跳过", len(done_today))
 
     results = {"chain": [], "indie": [], "other": []}
 
@@ -533,43 +710,75 @@ def scrape_movies(delay: float = 0.5) -> dict:
     for i, mov in enumerate(movies, 1):
         mid = mov["movie_id"]
         title_jp = mov["title_jp"]
-        # Check if title_jp exists in DB, reuse fields if so
+
+        # 已在本轮抓完 → 从 DB 取回分类结果，跳过重抓（断点续跑，不重复已完成操作）。
+        if mid in done_today:
+            db_row = conn.execute("SELECT * FROM movies WHERE movie_id=?", (mid,)).fetchone()
+            if db_row:
+                m = dict(db_row)
+                m["rank"] = mov["rank"]
+                cat = m.get("category") or "other"
+                m["_theaters"] = [
+                    r["theater_id"] for r in conn.execute(
+                        "SELECT theater_id FROM screenings WHERE movie_id=?", (mid,)
+                    ).fetchall()
+                ]
+                m["_theater_names"] = [
+                    r["name"] for r in conn.execute(
+                        "SELECT t.name FROM screenings s JOIN theaters t "
+                        "ON t.theater_id=s.theater_id WHERE s.movie_id=?", (mid,)
+                    ).fetchall()
+                ]
+                results.setdefault(cat, []).append(m)
+                logger.info("[%d/%d] %s | %s（已抓，跳过）", i, len(movies), cat, title_jp)
+                continue
+
+        # fetcher 冷却用尽 → 干净停下，已抓数据已落库，下次续跑补完
+        if fetcher.exhausted():
+            logger.warning("Step1：抓取冷却用尽，本轮提前停止（已抓 %d 部，下次续跑）", i - 1)
+            break
+        # Check if title_jp exists in DB, reuse fields if so. director/script/cast
+        # were added later, so include them to detect (and backfill) old rows.
         row = conn.execute(
-            "SELECT country, title_original, year, duration, release_date, director FROM movies WHERE title_jp=?",
+            "SELECT country, title_original, year, duration, release_date, director, "
+            "eiga_rating, eiga_rating_count, script, cast_names FROM movies WHERE title_jp=?",
             (title_jp,)
         ).fetchone()
-        # Reuse DB row only when the key fields are populated. If country or
-        # eiga_rating is missing (older step1 versions saved neither), re-fetch
-        # the detail page instead of carrying the gap forward.
-        existing_eiga_rating = None
-        existing_eiga_rating_count = None
-        try:
-            extra = conn.execute(
-                "SELECT eiga_rating, eiga_rating_count FROM movies WHERE title_jp=?",
-                (title_jp,),
-            ).fetchone()
-            if extra:
-                existing_eiga_rating, existing_eiga_rating_count = extra[0], extra[1]
-        except Exception:
-            pass
+        existing_eiga_rating = row["eiga_rating"] if row else None
+        existing_eiga_rating_count = row["eiga_rating_count"] if row else None
 
-        # Re-fetch if country missing OR eiga_rating never recorded (NULL).
+        # Re-fetch the detail page if any key field is missing: country, eiga_rating
+        # (NULL only — 0 is a real "no rating" value), director, or cast. This
+        # backfills staff/cast for rows scraped before those columns existed.
         # eiga_rating==0 means the page had no rating; that's a real value, not a gap.
-        if row and row[0] and existing_eiga_rating is not None:
+        reuse = bool(
+            row and row["country"] and existing_eiga_rating is not None
+            and row["director"] and row["cast_names"]
+        )
+        if reuse:
             mov.update({
-                "country": row[0],
-                "title_original": row[1],
-                "year": row[2],
-                "duration": row[3],
-                "release_date": row[4],
-                "director": row[5],
+                "country": row["country"],
+                "title_original": row["title_original"],
+                "year": row["year"],
+                "duration": row["duration"],
+                "release_date": row["release_date"],
+                "director": row["director"],
                 "eiga_rating": existing_eiga_rating,
                 "eiga_rating_count": existing_eiga_rating_count,
+                "script": row["script"],
+                "cast": row["cast_names"],
             })
             logger.info(f"[Step1] Skipped detail for {title_jp} (reuse DB)")
         else:
             if row:
-                missing = ("country" if not (row and row[0]) else "eiga_rating")
+                if not row["country"]:
+                    missing = "country"
+                elif existing_eiga_rating is None:
+                    missing = "eiga_rating"
+                elif not row["director"]:
+                    missing = "director"
+                else:
+                    missing = "cast"
                 logger.info(f"[Step1] Re-fetching detail for {title_jp} ({missing} missing)")
             detail = _scrape_movie_detail(mid, delay=delay)
             mov.update(detail)
@@ -613,12 +822,13 @@ def scrape_movies(delay: float = 0.5) -> dict:
                 """INSERT INTO movies
                    (movie_id, title_jp, country, title_original, year,
                     duration, release_date, director, rank, category, eiga_url,
-                    eiga_rating, eiga_rating_count)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    eiga_rating, eiga_rating_count, script, cast_names)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (mid, mov["title_jp"], mov.get("country"), mov.get("title_original"),
                  mov.get("year"), mov.get("duration"), mov.get("release_date"),
                  mov.get("director"), mov["rank"], category, mov["eiga_url"],
-                 mov.get("eiga_rating"), mov.get("eiga_rating_count")),
+                 mov.get("eiga_rating"), mov.get("eiga_rating_count"),
+                 mov.get("script"), mov.get("cast")),
             )
         else:
             # Full UPDATE so re-fetched detail (country / eiga_rating / etc.)
@@ -634,13 +844,16 @@ def scrape_movies(delay: float = 0.5) -> dict:
                        release_date=COALESCE(?, release_date),
                        director=COALESCE(?, director),
                        eiga_rating=COALESCE(?, eiga_rating),
-                       eiga_rating_count=COALESCE(?, eiga_rating_count)
+                       eiga_rating_count=COALESCE(?, eiga_rating_count),
+                       script=COALESCE(?, script),
+                       cast_names=COALESCE(?, cast_names)
                      WHERE movie_id=?""",
                 (category, mov["rank"],
                  mov.get("country"), mov.get("title_original"),
                  mov.get("year"), mov.get("duration"),
                  mov.get("release_date"), mov.get("director"),
                  mov.get("eiga_rating"), mov.get("eiga_rating_count"),
+                 mov.get("script"), mov.get("cast"),
                  mid),
             )
 
@@ -651,6 +864,26 @@ def scrape_movies(delay: float = 0.5) -> dict:
                 "INSERT OR IGNORE INTO screenings (movie_id, theater_id) VALUES (?, ?)",
                 (mid, tid),
             )
+
+        # Save real showtimes per theater. Showtimes change daily, so wipe this
+        # movie's previous showtimes and re-store the fresh weekly schedule.
+        if scrape_showtimes:
+            conn.execute("DELETE FROM showtimes WHERE movie_id=?", (mid,))
+            total_slots = 0
+            for tid in relevant_tids:
+                slots = _scrape_showtimes(mid, tid, delay=delay)
+                for s in slots:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO showtimes
+                           (movie_id, theater_id, show_date, start_time, end_time, ticket_url)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (mid, tid, s["show_date"], s["start_time"],
+                         s["end_time"], s["ticket_url"]),
+                    )
+                total_slots += len(slots)
+            if total_slots:
+                logger.info("[Step1] %s: %d showtimes across %d theaters",
+                            title_jp, total_slots, len(relevant_tids))
 
         # Insert a daily snapshot row (snapshot_date, rank, movie_id)
         # Use JST date to stay consistent with last_run_date which is also stored as JST.
@@ -678,6 +911,9 @@ def scrape_movies(delay: float = 0.5) -> dict:
         )
 
         results[category].append(mov)
+
+        # 每部抓完立刻落库：免费云中途被杀也已保存，重跑跳过本部。
+        conn.commit()
 
     conn.commit()
     conn.close()

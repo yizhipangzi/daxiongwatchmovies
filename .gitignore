@@ -58,7 +58,10 @@ htmlcov/
 # Logs
 *.log
 
+.miniprogram_token_cache.json
 .wechat_token_cache.json
 config.yaml
 data/
 output/
+# cloud 运行日志（local 不产生；cloud 只留 2 天）
+logs/

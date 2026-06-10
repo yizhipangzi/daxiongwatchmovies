@@ -11,7 +11,7 @@ import random
 import re
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -236,17 +236,6 @@ def _ensure_douban_table(conn: sqlite3.Connection):
         conn.commit()
     except Exception:
         pass
-    # Add new_movie_rating columns for existing DBs (idempotent).
-    # Used for movies without an aggregated douban_score yet: average of star
-    # ratings from the status=P (想看) comments page, on a 1-5 scale.
-    for col_def in ("new_movie_rating REAL",
-                    "new_movie_rating_count INTEGER",
-                    "new_movie_rating_at TEXT"):
-        try:
-            conn.execute(f"ALTER TABLE douban_matches ADD COLUMN {col_def}")
-            conn.commit()
-        except Exception:
-            pass
     # eiga.com 1-5 rating + review count, used by the 电影日和 section.
     # step1 also adds these, but step2 may be invoked standalone (e.g. for
     # briefing-only runs) so we re-assert here.
@@ -466,14 +455,9 @@ def match_movies(categories: tuple = ("chain", "indie"),
                         if soup:
                             score, votes = _parse_rating(soup)
                             if score:
-                                # Real score is now available — clear any stale
-                                # 新片推荐度 fields so they aren't shown again.
                                 conn.execute(
                                     "UPDATE douban_matches "
-                                    "SET douban_score=?, douban_votes=?, "
-                                    "    new_movie_rating=NULL, "
-                                    "    new_movie_rating_count=NULL, "
-                                    "    new_movie_rating_at=NULL "
+                                    "SET douban_score=?, douban_votes=? "
                                     "WHERE movie_id=?",
                                     (score, votes, mid)
                                 )
@@ -732,6 +716,218 @@ def enrich_top_movies(top_n: int = 15, delay: float = 2.0) -> int:
                     meta.get("title_cn", subject_id), score)
 
     conn.close()
+    return enriched
+
+
+def _save_douban_details(conn, mid: str, subject_id: str, soup,
+                         movie_year, movie_country, now: str) -> dict:
+    """Parse a fetched Douban movie page and upsert douban_matches + douban_details.
+
+    Shared by the briefing enrich and the full-catalog enrich so the two paths
+    can't drift. Returns the parsed meta dict augmented with 'score'/'votes'.
+    Existing aggregated scores are never overwritten with a 0 from a miss.
+    """
+    from scraper.douban import _parse_rating, _parse_meta
+
+    score, votes = _parse_rating(soup)
+    meta = _parse_meta(soup)
+    meta["score"] = score
+    meta["votes"] = votes
+    if meta.get("is_tv"):
+        return meta
+
+    # 空页面（bot/sorry 页）：没分、没中文名、没导演 → 没真正拿到数据。
+    # 不写库（保持 updated_at 为 NULL/旧值），让下次 enrich 重试，确保最终取到，
+    # step4 才有东西可输出。
+    if not score and not meta.get("title_cn") and not meta.get("director"):
+        meta["empty"] = True
+        return meta
+
+    douban_year = meta.get("year", 0)
+    douban_country = meta.get("country", "")
+    year_ok = _check_year_match(movie_year or 0, douban_year)
+    country_ok = _check_country_match(movie_country or "", douban_country)
+
+    existing_score = conn.execute(
+        "SELECT douban_score FROM douban_matches WHERE movie_id=?", (mid,)
+    ).fetchone()
+    keep_score = score or (existing_score and existing_score["douban_score"]) or 0
+
+    conn.execute(
+        """UPDATE douban_matches SET
+           title_cn=?, douban_score=?, douban_votes=?,
+           director=?, cast=?, genre=?,
+           douban_year=?, douban_country=?,
+           year_ok=?, country_ok=?, verified=?
+           WHERE movie_id=?""",
+        (meta.get("title_cn", ""), keep_score, votes,
+         meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
+         douban_year, douban_country,
+         1 if year_ok else 0, 1 if country_ok else 0,
+         1 if (year_ok and country_ok) else 0,
+         mid)
+    )
+
+    try:
+        sel_reviews = _select_reviews_from_soup(soup, score_present=bool(score))
+        short_reviews_json = json.dumps(sel_reviews, ensure_ascii=False)
+    except Exception:
+        short_reviews_json = json.dumps([])
+    trailers_json = json.dumps(meta.get("trailers", []) or [], ensure_ascii=False)
+
+    conn.execute(
+        """INSERT OR REPLACE INTO douban_details
+           (movie_id, douban_id, title_cn, douban_score, douban_votes,
+            director, cast, genre, douban_year, douban_country, douban_url,
+            want_to_watch, watched, trailer_urls, short_reviews, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (mid, subject_id, meta.get("title_cn", ""), score, votes,
+         meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
+         douban_year, douban_country,
+         f"https://movie.douban.com/subject/{subject_id}/",
+         meta.get("want_to_watch", 0) or 0, meta.get("watched", 0) or 0,
+         trailers_json, short_reviews_json, now)
+    )
+    return meta
+
+
+def enrich_all_movies(categories: tuple = ("chain", "indie"),
+                      delay: float = 2.0,
+                      refresh_days: int = 7,
+                      limit: int = 0,
+                      max_cooldowns: int = 3) -> int:
+    """Fetch full Douban details for EVERY matched movie — not just the briefing top-5.
+
+    Populates director / cast / genre / 想看 / 看过 / 短评 / trailers into
+    ``douban_details`` (and refreshes ``douban_matches``) for all movies in the
+    given categories that have a verified Douban id. This is the dataset the
+    mini-program needs: chain + indie cover all 23-ku (9-district) theaters.
+
+    Designed to grind through hundreds of movies across multiple days while
+    surviving Douban rate-limiting:
+      - Movies whose details were refreshed within ``refresh_days`` are skipped,
+        so a daily run keeps the whole catalog fresh on a rolling window.
+      - Never-enriched movies are processed first (NULL updated_at sorts first).
+      - ``limit`` caps how many are fetched per run (0 = no cap).
+      - On repeated Douban failures the run cools down up to ``max_cooldowns``
+        times, then stops cleanly so the next run can resume.
+
+    Returns the number of movies enriched this run.
+    """
+    from scraper.douban import _fetch_movie_page, init_douban_session, CookieExpiredError
+
+    cfg = _load_config()
+    douban_cfg = cfg.get("douban", {})
+    if douban_cfg:
+        init_douban_session(douban_cfg)
+
+    conn = _get_db()
+    _ensure_douban_table(conn)
+
+    now = datetime.now().isoformat(timespec="seconds")
+    cutoff = (datetime.now() - timedelta(days=refresh_days)).isoformat(timespec="seconds")
+
+    cat_ph = ",".join("?" for _ in categories)
+    # Verified matches in the target categories, with their last detail-fetch time.
+    # NULL updated_at (never enriched) sorts first; then oldest first.
+    rows = conn.execute(
+        f"""SELECT m.movie_id, m.douban_id, mv.title_jp,
+                   mv.year AS movie_year, mv.country AS movie_country,
+                   d.updated_at AS details_at,
+                   d.title_cn AS d_title_cn, d.director AS d_director
+              FROM douban_matches m
+              JOIN movies mv ON m.movie_id = mv.movie_id
+              LEFT JOIN douban_details d ON d.movie_id = m.movie_id
+             WHERE m.douban_id IS NOT NULL AND m.douban_id != ''
+               AND m.verified = 1
+               AND mv.category IN ({cat_ph})
+             ORDER BY (d.updated_at IS NOT NULL), d.updated_at, mv.rank""",
+        tuple(categories),
+    ).fetchall()
+
+    def _needs_fetch(r) -> bool:
+        # 没详情 / 超过刷新窗口 → 要抓。
+        if not (r["details_at"] and r["details_at"] >= cutoff):
+            return True
+        # 在窗口内但内容是空的（旧逻辑可能存过空行）→ 仍要重抓，确保取到真数据。
+        empty = not (r["d_title_cn"] or "").strip() and not (r["d_director"] or "").strip()
+        return empty
+
+    targets = [r for r in rows if _needs_fetch(r)]
+    skipped_fresh = len(rows) - len(targets)
+    if limit > 0:
+        targets = targets[:limit]
+
+    if skipped_fresh:
+        logger.info("Full enrich: %d movie(s) still fresh (<%dd), skipping",
+                    skipped_fresh, refresh_days)
+    if not targets:
+        logger.info("Full enrich: nothing to do (%d matched movies all fresh)", len(rows))
+        conn.close()
+        return 0
+
+    logger.info("Full enrich: %d movie(s) to fetch (of %d matched)", len(targets), len(rows))
+    enriched = 0
+    tracker = _FetchRetryTracker(label="Full enrich", max_cooldowns=max_cooldowns)
+    try:
+        for idx, t in enumerate(targets, 1):
+            if idx > 1:
+                time.sleep(random.uniform(1.5, 4.0))
+                if (idx - 1) % 5 == 0:
+                    breath = random.uniform(12, 25)
+                    logger.info("Breathing pause: %.0fs after %d fetches", breath, idx - 1)
+                    time.sleep(breath)
+
+            if not tracker.should_continue():
+                logger.info("Full enrich [%d/%d]: retry budget exhausted — stopping",
+                            idx, len(targets))
+                break
+
+            mid = t["movie_id"]
+            subject_id = t["douban_id"]
+            try:
+                soup = _fetch_movie_page(subject_id, delay=delay)
+            except CookieExpiredError:
+                logger.error("Full enrich: cookie blocked — stopping so it can resume later")
+                break
+            except Exception as exc:
+                tracker.record_failure()
+                logger.warning("Full enrich: fetch error for id=%s: %s", subject_id, exc)
+                continue
+            if not soup:
+                tracker.record_failure()
+                logger.warning("Full enrich: could not fetch page for id=%s", subject_id)
+                continue
+
+            meta = _save_douban_details(conn, mid, subject_id, soup,
+                                        t["movie_year"], t["movie_country"], now)
+            if meta.get("is_tv"):
+                tracker.record_success()
+                continue
+            # 空页面（bot/sorry）：_save_douban_details 已判定并**未入库**，
+            # 这里只记失败 + 跳过，下次重试（确保最终取到，step4 才有数据）。
+            if meta.get("empty"):
+                tracker.record_failure()
+                logger.warning("Full enrich [%d/%d]: 空页面 id=%s — 未入库，下次重试",
+                               idx, len(targets), subject_id)
+                continue
+
+            tracker.record_success()
+            conn.commit()
+            enriched += 1
+            logger.info("Full enrich [%d/%d] %s | %s %.1f分 (%d看过/%d想看)",
+                        idx, len(targets), t["title_jp"],
+                        meta.get("title_cn", subject_id), meta.get("score") or 0,
+                        meta.get("watched", 0) or 0, meta.get("want_to_watch", 0) or 0)
+    finally:
+        try:
+            from scraper.douban import close_pw_browser
+            close_pw_browser()
+        except Exception:
+            pass
+        conn.close()
+
+    logger.info("Full enrich: %d/%d enriched this run", enriched, len(targets))
     return enriched
 
 
@@ -1009,109 +1205,6 @@ def enrich_eiga_reviews_for_briefing(top_n: int = 5, delay: float = 1.0) -> int:
     conn.close()
     return enriched
 
-
-def enrich_new_movie_ratings(delay: float = 2.0) -> int:
-    """Compute a "新片推荐度" (new-movie recommendation score) from short-review
-    star ratings for movies that have a Douban match but no aggregated score yet.
-
-    Targets: movies with douban_id set, douban_score = 0, AND a successful page
-    fetch today (history row exists for today). Fetches the status=P (想看)
-    comments page, averages the 1-5 star ratings found there, and saves the
-    result to ``douban_matches.new_movie_rating``.
-
-    Returns the number of movies that received a new rating value.
-    """
-    from scraper.douban import fetch_short_review_ratings, init_douban_session
-
-    conn = _get_db()
-    _ensure_douban_table(conn)
-
-    cfg = _load_config()
-    douban_cfg = cfg.get("douban", {})
-    if douban_cfg:
-        init_douban_session(douban_cfg)
-
-    now = datetime.now().isoformat(timespec="seconds")
-    today_str = now[:10]
-
-    skipped_done_today = conn.execute(
-        """SELECT COUNT(*) FROM douban_matches
-           WHERE douban_id IS NOT NULL AND douban_id != ''
-             AND COALESCE(douban_score, 0) = 0
-             AND SUBSTR(COALESCE(new_movie_rating_at, ''), 1, 10) = ?""",
-        (today_str,)
-    ).fetchone()[0]
-
-    rows = conn.execute(
-        """SELECT m.movie_id, m.douban_id, mv.title_jp
-           FROM douban_matches m
-           JOIN movies mv ON m.movie_id = mv.movie_id
-           WHERE m.douban_id IS NOT NULL AND m.douban_id != ''
-             AND COALESCE(m.douban_score, 0) = 0
-             AND SUBSTR(COALESCE(m.new_movie_rating_at, ''), 1, 10) != ?
-             AND EXISTS (
-                 SELECT 1 FROM douban_matches_history h
-                 WHERE h.movie_id = m.movie_id
-                   AND SUBSTR(h.snapshot_at, 1, 10) = ?
-             )""",
-        (today_str, today_str)
-    ).fetchall()
-
-    if skipped_done_today:
-        logger.info("New-movie rating: skipping %d movie(s) already rated today",
-                    skipped_done_today)
-
-    if not rows:
-        logger.info("New-movie rating: no candidates")
-        conn.close()
-        return 0
-
-    logger.info("New-movie rating: enriching %d movies (score=0 + page fetched today)",
-                len(rows))
-    enriched = 0
-    tracker = _FetchRetryTracker(label="New-movie rating")
-    for idx, row in enumerate(rows, 1):
-        # Inter-movie pause to avoid hammering Douban
-        if idx > 1:
-            time.sleep(random.uniform(1.5, 4.0))
-            if (idx - 1) % 5 == 0:
-                breath = random.uniform(12, 25)
-                logger.info("Breathing pause: %.0fs after %d short-review fetches",
-                            breath, idx - 1)
-                time.sleep(breath)
-        if not tracker.should_continue():
-            logger.info("New-movie rating [%d/%d]: retry budget exhausted — stopping",
-                        idx, len(rows))
-            break
-        try:
-            ratings = fetch_short_review_ratings(row["douban_id"], delay=delay)
-            tracker.record_success()
-        except Exception as exc:
-            tracker.record_failure()
-            logger.warning("New-movie rating fetch failed for %s: %s",
-                           row["title_jp"], exc)
-            continue
-        if ratings:
-            avg = sum(ratings) / len(ratings)
-            conn.execute(
-                "UPDATE douban_matches "
-                "SET new_movie_rating=?, new_movie_rating_count=?, new_movie_rating_at=? "
-                "WHERE movie_id=?",
-                (avg, len(ratings), now, row["movie_id"])
-            )
-            conn.commit()
-            enriched += 1
-            logger.info("[%d/%d] %s 🎬 %.2f/5 (%d早期評価)",
-                        idx, len(rows), row["title_jp"], avg, len(ratings))
-        else:
-            logger.info("[%d/%d] %s — no rated short reviews",
-                        idx, len(rows), row["title_jp"])
-
-    logger.info("New-movie rating: %d/%d movies enriched", enriched, len(rows))
-    conn.close()
-    return enriched
-
-
 # ── MD出力 ───────────────────────────────────────────────────────────────────
 
 def generate_step2_md(results: Optional[dict] = None) -> Path:
@@ -1138,8 +1231,8 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
         lines += [
             f"## {label} ({verified_count}本マッチ / {len(movies)}本中)",
             "",
-            "| # | Movie ID | Rank | タイトル | 原題 | 国(eiga) | 年 | 中文名 | 豆瓣分 | 新片推荐度 | 評価数 | 監督 | 出演 |",
-            "|---|----------|------|---------|------|----------|-----|--------|--------|-----------|--------|------|------|",
+            "| # | Movie ID | Rank | タイトル | 原題 | 国(eiga) | 年 | 中文名 | 豆瓣分 | 評価数 | 監督 | 出演 |",
+            "|---|----------|------|---------|------|----------|-----|--------|--------|--------|------|------|",
         ]
         for i, m in enumerate(movies, 1):
             mid = m.get("movie_id") or "-"
@@ -1161,24 +1254,12 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
                 title_cn = (f'<a href="{douban_url}" target="_blank">{title_cn_raw}</a>'
                             if douban_url else title_cn_raw)
                 score_str = f"{score:.1f}" if score else "-"
-                # 新片推荐度 is only meaningful while there's no aggregated Douban
-                # score yet — once Douban has a real score, hide this field.
-                if score:
-                    new_movie_str = "-"
-                else:
-                    nm_rating = m.get("new_movie_rating")
-                    nm_count = m.get("new_movie_rating_count") or 0
-                    if nm_rating:
-                        new_movie_str = f"{nm_rating:.2f}/5 ({nm_count})"
-                    else:
-                        new_movie_str = "-"
             else:
                 title_cn = ""
                 score_str = ""
                 votes = ""
                 director = ""
                 cast = ""
-                new_movie_str = ""
 
             # Escape pipe characters in all text fields for MD table
             _p = lambda s: str(s).replace('|', '') if s else s
@@ -1186,7 +1267,7 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
                         if mid and mid != "-" else mid)
             lines.append(
                 f"| {i} | {mid_cell} | {rank} | {_p(title)} | {_p(orig)} | {country_e} "
-                f"| {year_e} | {title_cn} | {score_str} | {new_movie_str} "
+                f"| {year_e} | {title_cn} | {score_str} "
                 f"| {votes} | {_p(director)} | {_p(cast)} |"
             )
 
@@ -1360,8 +1441,7 @@ def _load_results_from_db() -> dict:
         movies = conn.execute(
             "SELECT m.*, d.douban_id, d.title_cn, d.douban_score, d.douban_votes, "
             "d.director, d.cast, d.genre, d.douban_year, d.douban_country, "
-            "d.douban_url, d.year_ok, d.country_ok, d.verified, "
-            "d.new_movie_rating, d.new_movie_rating_count "
+            "d.douban_url, d.year_ok, d.country_ok, d.verified "
             "FROM movies m LEFT JOIN douban_matches d ON m.movie_id = d.movie_id "
             "WHERE m.category = ? ORDER BY m.rank",
             (cat,)

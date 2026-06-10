@@ -91,11 +91,7 @@ EIGA_REVIEW_LINE_JA_ONLY = " {rating}★ {text_ja} -{author}"
 #   Placeholders: score, watched, want
 STATS_WITH_SCORE = "{score:.1f}分 / {watched}看过 / {want}想看"
 
-# When the movie has no aggregated score but does have a 新片推荐度 average.
-#   Placeholders: rating, count, watched, want
-STATS_WITH_NEW_RATING = "新片推荐度 {rating:.1f}/5 ({count}) / {watched}看过 / {want}想看"
-
-# Fallback when there is no score and no new-movie rating.
+# Fallback when there is no aggregated Douban score.
 #   Placeholders: watched, want
 STATS_NO_DATA = "-分 / {watched}看过 / {want}想看"
 
