@@ -16,6 +16,7 @@ VM / 本地 / step4 之间的同步中枢：
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import logging
 import re
@@ -104,12 +105,16 @@ def push_db(config: dict, db_path: Path = DB_PATH) -> str:
     token = wxcloud.get_access_token(config)
     cloud_path = _cloud_db_path(config)
     _checkpoint_wal(db_path)  # 把 WAL 合并进主库，避免漏掉最近提交
-    fid = wxcloud.upload(env, token, cloud_path, Path(db_path).read_bytes())
+    # gzip 压缩再传：SQLite 压缩率高，几 MB 能压到几百 KB，避免 COS 因传太慢
+    # 报 UserNetworkTooSlow（文件越小越快传完）。pull 端按 gzip 魔数自动解压。
+    raw = Path(db_path).read_bytes()
+    gz = gzip.compress(raw, compresslevel=6)
+    fid = wxcloud.upload(env, token, cloud_path, gz)
     # 同一路径上传 file_id 稳定；首次拿到就回写 config 方便以后 pull。
     if fid and fid != _db_fileid(config):
         _save_db_fileid_to_config(fid)
-    logger.info("push_db: %s → %s (%d bytes)", db_path, cloud_path,
-                Path(db_path).stat().st_size)
+    logger.info("push_db: %s → %s (%d → %d bytes, gzip)",
+                db_path, cloud_path, len(raw), len(gz))
     return fid
 
 
@@ -129,6 +134,9 @@ def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
     except Exception as exc:
         logger.warning("pull_db: 下载失败（可能云上还没有），跳过: %s", exc)
         return False
+    # 按 gzip 魔数（1f 8b）自动解压；旧的未压缩文件（裸 sqlite）原样用，兼容过渡。
+    if content[:2] == b"\x1f\x8b":
+        content = gzip.decompress(content)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     # 先写临时文件再原子替换，避免写一半损坏。
     with tempfile.NamedTemporaryFile(dir=str(Path(db_path).parent), delete=False) as tf:
