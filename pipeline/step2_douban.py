@@ -827,8 +827,21 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
     now = datetime.now().isoformat(timespec="seconds")
     cutoff = (datetime.now() - timedelta(days=refresh_days)).isoformat(timespec="seconds")
 
+    # 范围 = 匹配上豆瓣(verified) 且（在那 9 个区有排片 或 是 briefing 的 top5）。
+    # 9 区 area_code 以 step4 的 DISTRICTS 为单一来源；briefing top5 即使不在 9 区也要
+    # enrich（简报要用）。不再无脑取全部 chain+indie（会多抓只在大塚/神保町/田端的片）。
+    from pipeline.step4_export import DISTRICTS as _DISTRICTS
+    district_areas = tuple({a for d in _DISTRICTS for a in d["areas"]})
+    try:
+        from generator.briefing import select_briefing_movie_ids
+        briefing_ids = tuple(select_briefing_movie_ids(top_n=5))
+    except Exception:
+        briefing_ids = ()
+
     cat_ph = ",".join("?" for _ in categories)
-    # Verified matches in the target categories, with their last detail-fetch time.
+    area_ph = ",".join("?" for _ in district_areas) or "''"
+    brief_ph = ",".join("?" for _ in briefing_ids) or "''"
+    # Verified matches in scope, with their last detail-fetch time.
     # NULL updated_at (never enriched) sorts first; then oldest first.
     rows = conn.execute(
         f"""SELECT m.movie_id, m.douban_id, mv.title_jp,
@@ -841,8 +854,16 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
              WHERE m.douban_id IS NOT NULL AND m.douban_id != ''
                AND m.verified = 1
                AND mv.category IN ({cat_ph})
+               AND (
+                   m.movie_id IN (
+                       SELECT s.movie_id FROM screenings s
+                       JOIN theaters t ON t.theater_id = s.theater_id
+                       WHERE t.area_code IN ({area_ph})
+                   )
+                   OR m.movie_id IN ({brief_ph})
+               )
              ORDER BY (d.updated_at IS NOT NULL), d.updated_at, mv.rank""",
-        tuple(categories),
+        tuple(categories) + district_areas + briefing_ids,
     ).fetchall()
 
     def _needs_fetch(r) -> bool:
@@ -868,6 +889,14 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
 
     logger.info("Full enrich: %d movie(s) to fetch (of %d matched)", len(targets), len(rows))
     enriched = 0
+    # cloud（无人值守）：单条失败/cookie 被拦只跳过该片、继续整轮，不中断整个 step3。
+    # 已匹配电影抓详情页一般不会被反爬，所以适合在 cloud 上跑完。local 保持原样（可停）。
+    keep_going = False
+    try:
+        from scraper import fetcher as _fetcher
+        keep_going = _fetcher.is_cloud()
+    except Exception:
+        pass
     tracker = _FetchRetryTracker(label="Full enrich", max_cooldowns=max_cooldowns)
     try:
         for idx, t in enumerate(targets, 1):
@@ -878,7 +907,8 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
                     logger.info("Breathing pause: %.0fs after %d fetches", breath, idx - 1)
                     time.sleep(breath)
 
-            if not tracker.should_continue():
+            # should_continue() 仍会做冷却退避；cloud 下即使退避用尽也不 break，继续逐部跳过。
+            if not tracker.should_continue() and not keep_going:
                 logger.info("Full enrich [%d/%d]: retry budget exhausted — stopping",
                             idx, len(targets))
                 break
@@ -888,6 +918,11 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
             try:
                 soup = _fetch_movie_page(subject_id, delay=delay)
             except CookieExpiredError:
+                tracker.record_failure()
+                if keep_going:
+                    logger.warning("Full enrich [%d/%d]: cookie 被拦 id=%s — 跳过该片，继续",
+                                   idx, len(targets), subject_id)
+                    continue
                 logger.error("Full enrich: cookie blocked — stopping so it can resume later")
                 break
             except Exception as exc:

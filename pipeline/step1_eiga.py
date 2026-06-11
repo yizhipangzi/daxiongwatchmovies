@@ -66,7 +66,9 @@ _ORIG_RE = re.compile(
     # get_text() that the regex would otherwise capture in full.
     r"原題[^：:\n]*[：:]\s*(.+?)(?=\s*(?:配給|配信|配信開始日|劇場公開日|その他|その他の公開日|オフィシャル|公式|あらすじ|スタッフ)|\n|$)"
 )
-_RELEASE_RE = re.compile(r"劇場公開日\s*(\d{4}年\d{1,2}月\d{1,2}日)")
+# 注意 label 和日期间常有全角/半角冒号「：」「:」——必须允许，否则会漏掉主上映日，
+# .search 会跑去匹配侧栏「上映中/即将上映」列表里别的电影的日期（曾把鬼滅抓成别片的日期）。
+_RELEASE_RE = re.compile(r"劇場公開日[\s：:]*(\d{4}年\d{1,2}月\d{1,2}日)")
 
 
 # ── DB Setup ─────────────────────────────────────────────────────────────────
@@ -1007,6 +1009,59 @@ def backfill_movie_details(category: str = "chain",
     conn.close()
     logger.info("Backfill done: %d movies updated", updated)
     return updated
+
+
+def backfill_release_dates(categories: Optional[tuple] = None,
+                           delay: float = 0.5,
+                           limit: int = 0) -> tuple[int, int]:
+    """重抓详情页，用修正后的正则更新电影的 release_date（劇場公開日）。
+
+    修复历史上「劇場公開日 正则漏全角冒号」导致的错误上映日（曾把主上映日跳过、
+    抓成页面侧栏别的电影的日期）。只更新 release_date，其它字段不动。
+
+    Args:
+        categories: 限定 category（如 ("chain","indie")）；None = 全部电影。
+        delay: 每次请求的基础延时。
+        limit: 0 = 不限，否则本次最多处理多少部。
+
+    可断点续跑：fetcher 冷却用尽会提前停止。返回 (扫描数, 修正数)。
+    """
+    conn = _get_db()
+    if categories:
+        ph = ",".join("?" for _ in categories)
+        rows = conn.execute(
+            f"SELECT movie_id, title_jp, release_date FROM movies "
+            f"WHERE category IN ({ph}) ORDER BY rank",
+            tuple(categories),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT movie_id, title_jp, release_date FROM movies ORDER BY rank"
+        ).fetchall()
+    if limit > 0:
+        rows = rows[:limit]
+
+    from scraper import fetcher
+    fetcher.reset_state()
+    scanned = fixed = 0
+    for r in rows:
+        if fetcher.exhausted():
+            logger.warning("backfill_release_dates: 抓取冷却用尽，提前停止（已扫 %d 部，下次续跑）",
+                           scanned)
+            break
+        scanned += 1
+        detail = _scrape_movie_detail(r["movie_id"], delay=delay)
+        rd = detail.get("release_date")
+        if rd and rd != r["release_date"]:
+            conn.execute("UPDATE movies SET release_date=? WHERE movie_id=?",
+                         (rd, r["movie_id"]))
+            conn.commit()
+            fixed += 1
+            logger.info("[backfill release %d] %s: %s -> %s",
+                        fixed, r["title_jp"], r["release_date"], rd)
+    conn.close()
+    logger.info("backfill_release_dates: 扫描 %d 部，修正 %d 部", scanned, fixed)
+    return scanned, fixed
 
 
 # ── MD出力 ───────────────────────────────────────────────────────────────────

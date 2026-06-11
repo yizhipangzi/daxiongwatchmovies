@@ -417,12 +417,18 @@ def main() -> None:
         # of whether step1 scraped or skipped.
         step2_results = None
         if not args.no_douban:
-            from pipeline.step2_douban import match_movies, generate_step2_md
+            from pipeline.step2_douban import (
+                match_movies, generate_step2_md, enrich_all_movies,
+            )
             from scraper import fetcher
+            # step2：匹配（suggest API，拿 id + 评分）
             step2_results = match_movies(categories=("chain", "indie"), delay=5.0, resume=True)
             # cloud 环境只为小程序填库，不生成 step2 MD。
             if not fetcher.is_cloud():
                 generate_step2_md(step2_results)
+            # step3：对所有匹配上的区域电影抓豆瓣详情页（导演/主演/想看/看过/3 条短评），
+            # 写入 douban_details，供 step4 输出给小程序。可断点续跑、遇限流自动退避。
+            enrich_all_movies(delay=2.0)
 
         if not all_movies:
             logger.warning("未抓取到任何排期数据。使用演示数据代替。")

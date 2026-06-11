@@ -1,9 +1,8 @@
 """Poster collage generator for the WeChat briefing.
 
 For each briefing section, fetches up to 5 movie posters from eiga.com and
-assembles a scattered "Polaroid pinboard" style collage. Posters are placed
-with slight rotation, jittered positions, and random z-order so the result
-looks dynamic rather than a rigid grid.
+arranges them in a simple horizontal row — no rotation, no overlap — at a
+modest size.
 
 Public API:
     fetch_eiga_poster(movie_id, ...) -> Optional[Path]
@@ -11,9 +10,7 @@ Public API:
 """
 from __future__ import annotations
 
-import io
 import logging
-import random
 import re
 import time
 from pathlib import Path
@@ -238,42 +235,15 @@ def _open_image(path: Path) -> Optional[Image.Image]:
         return None
 
 
-def _make_polaroid(img: Image.Image, target_h: int) -> Image.Image:
-    """Resize an image to `target_h` (keeping aspect) and add a Polaroid-style
-    white border (thicker at the bottom)."""
-    aspect = img.width / max(img.height, 1)
-    target_w = max(int(target_h * aspect), 1)
-    resized = img.resize((target_w, target_h), Image.LANCZOS)
+def make_row_collage(image_paths: list[Path],
+                     output_path: Path,
+                     total_width: int = 1000) -> Optional[Path]:
+    """把最多 5 张海报水平排成一行：不旋转、不重叠。
 
-    border = max(8, target_h // 36)
-    bottom = border * 3  # taller bottom border for Polaroid look
-    bordered = Image.new(
-        "RGBA",
-        (target_w + border * 2, target_h + border + bottom),
-        (250, 248, 245, 255),
-    )
-    bordered.paste(resized, (border, border))
-    return bordered
-
-
-def make_scattered_collage(image_paths: list[Path],
-                           output_path: Path,
-                           canvas_size: tuple[int, int] = (1080, 560),
-                           seed: Optional[int] = None) -> Optional[Path]:
-    """Build a scattered Polaroid-style collage from up to 5 poster images.
-
-    Layout characteristics (non-rigid by design):
-      - Each poster gets a white Polaroid frame (thicker bottom border)
-      - Slight rotation per image (-9° to +9°)
-      - Y-jitter and X-jitter inside per-image slots
-      - Z-order randomized so overlaps look natural
-      - Random size variation around a base height
-
-    Returns the output path on success, or ``None`` if no images loaded.
+    每张海报宽度 = ``total_width / 5``，海报按这个宽度等比缩小（高度随比例变化）。
+    海报横向并排（5 张时整图宽 ≈ total_width），高度不一时垂直居中、上下留底色。
+    返回输出路径；没有可用图片返回 ``None``。
     """
-    if seed is not None:
-        random.seed(seed)
-
     images: list[Image.Image] = []
     for p in image_paths[:5]:
         img = _open_image(p)
@@ -282,52 +252,20 @@ def make_scattered_collage(image_paths: list[Path],
     if not images:
         return None
 
-    canvas_w, canvas_h = canvas_size
-    # Warm off-white background to match Polaroid feel
-    canvas = Image.new("RGB", canvas_size, (245, 240, 230))
+    cell_w = max(total_width // 5, 1)   # 每张海报宽度 = 最终图宽 / 5
+    sized: list[Image.Image] = []
+    max_h = 1
+    for src in images:
+        aspect = src.width / max(src.height, 1)
+        h = max(int(round(cell_w / aspect)), 1)
+        sized.append(src.convert("RGB").resize((cell_w, h), Image.LANCZOS))
+        max_h = max(max_h, h)
 
-    n = len(images)
-    base_h = int(canvas_h * 0.80)
-    # Width allotted to each image's "slot"
-    slot_w = canvas_w / n
-
-    placements: list[tuple[Image.Image, int, int]] = []
-    for i, src in enumerate(images):
-        # Slight per-image size variation so the row doesn't look uniform
-        target_h = max(80, base_h + random.randint(-int(base_h * 0.10), int(base_h * 0.08)))
-        polaroid = _make_polaroid(src, target_h)
-
-        # If the bordered piece is wider than its slot, cap it
-        max_w = int(slot_w * 1.45)
-        if polaroid.width > max_w:
-            ratio = max_w / polaroid.width
-            polaroid = polaroid.resize(
-                (max(int(polaroid.width * ratio), 1), max(int(polaroid.height * ratio), 1)),
-                Image.LANCZOS,
-            )
-
-        # Random rotation
-        angle = random.uniform(-9, 9)
-        rotated = polaroid.rotate(
-            angle,
-            expand=True,
-            resample=Image.BICUBIC,
-            fillcolor=(0, 0, 0, 0),
-        )
-
-        # Position: spread along x with jitter; vertical centred with jitter
-        x_center = int(slot_w * i + slot_w / 2 + random.randint(-int(slot_w * 0.08), int(slot_w * 0.08)))
-        y_center = canvas_h // 2 + random.randint(-30, 30)
-        px = x_center - rotated.width // 2
-        py = y_center - rotated.height // 2
-        placements.append((rotated, px, py))
-
-    # Random z-order: shuffle paste sequence so it doesn't look left-to-right
-    order = list(range(len(placements)))
-    random.shuffle(order)
-    for idx in order:
-        rotated, px, py = placements[idx]
-        canvas.paste(rotated, (px, py), rotated)
+    n = len(sized)
+    canvas = Image.new("RGB", (cell_w * n, max_h), (245, 240, 230))
+    for i, im in enumerate(sized):
+        y = (max_h - im.height) // 2   # 高度不一时垂直居中
+        canvas.paste(im, (i * cell_w, y))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path, "JPEG", quality=88, optimize=True)
@@ -401,10 +339,7 @@ def make_section_collage(section_key: str,
     if not posters:
         return None
 
-    # Deterministic randomness per (section, date) so the same briefing run
-    # is reproducible while different sections look different.
-    seed = hash((section_key, date_str)) & 0xFFFFFFFF
-    return make_scattered_collage(posters, out_path, seed=seed)
+    return make_row_collage(posters, out_path)
 
 
 def cleanup_poster_cache(cache_dir: Path = POSTER_CACHE_DIR) -> int:

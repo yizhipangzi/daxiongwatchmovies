@@ -35,13 +35,6 @@ from .briefing_template import (
     STATS_WITH_SCORE,
     STATS_NO_DATA,
     STATS_WITH_EIGA_RATING,
-    REVIEW_LINE,
-    REVIEW_NONE,
-    REVIEW_ANONYMOUS,
-    REVIEW_HEADING_DOUBAN,
-    REVIEW_HEADING_EIGA,
-    EIGA_REVIEW_LINE,
-    EIGA_REVIEW_LINE_JA_ONLY,
     THEATER_SEP,
     NO_THEATERS,
     EMPTY_FIELD,
@@ -103,49 +96,7 @@ def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str],
         parts.append(f"[{name}]({url})" if url else name)
     theaters_line = THEATER_SEP.join(parts) if parts else NO_THEATERS
 
-    # Reviews
-    review_lines: list[str] = []
-    if review_source == "eiga":
-        review_heading = REVIEW_HEADING_EIGA
-        eiga_revs = m.get("eiga_reviews") or []
-        for r in eiga_revs[:3]:
-            body_zh = (r.get("body_zh") or "").strip()
-            body_ja = (r.get("body_ja") or "").strip()
-            author = (r.get("author") or "").strip() or REVIEW_ANONYMOUS
-            rating = r.get("rating")
-            rating_s = f"{rating:.1f}" if isinstance(rating, (int, float)) else "?"
-            if body_zh:
-                review_lines.append(EIGA_REVIEW_LINE.format(
-                    rating=rating_s, text_zh=body_zh, author=author,
-                ))
-            elif body_ja:
-                review_lines.append(EIGA_REVIEW_LINE_JA_ONLY.format(
-                    rating=rating_s, text_ja=body_ja, author=author,
-                ))
-        if not review_lines:
-            review_lines.append(REVIEW_NONE)
-    else:
-        review_heading = REVIEW_HEADING_DOUBAN
-        reviews_data = m.get("short_reviews") or []
-        watched_reviews = [
-            r for r in reviews_data
-            if isinstance(r, dict) and r.get("status") == "watched"
-        ]
-        chosen = watched_reviews[:3] if watched_reviews else reviews_data[:3]
-        if not chosen:
-            review_lines.append(REVIEW_NONE)
-        else:
-            for r in chosen:
-                if isinstance(r, dict):
-                    text = (r.get("text") or "").strip()
-                    author = (r.get("author") or "").strip() or REVIEW_ANONYMOUS
-                    if not text:
-                        continue
-                    review_lines.append(REVIEW_LINE.format(text=text, author=author))
-                else:
-                    review_lines.append(REVIEW_LINE.format(text=r, author=REVIEW_ANONYMOUS))
-    reviews_block = "\n".join(review_lines)
-
+    # 短评不放简报了——由 step4 输出到 JSON 给小程序显示。
     return MOVIE_BLOCK.format(
         rank=rank,
         name_link=name_link,
@@ -154,9 +105,7 @@ def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str],
         director=director,
         cast=cast,
         genre=genre,
-        review_heading=review_heading,
         theaters=theaters_line,
-        reviews=reviews_block,
     )
 
 
@@ -215,6 +164,14 @@ def _is_recent_release(m: dict, today: date, days: int = 365) -> bool:
     return (today - rd).days < days
 
 
+def _is_japan_only(m: dict) -> bool:
+    """制作国是否只有日本（eiga country 恰为 '日本'，非合拍片）。
+
+    eiga.com 单一制作国直接是 '日本'；合拍是 'アメリカ・日本合作' 之类，不算。
+    """
+    return (m.get("country") or "").strip() == "日本"
+
+
 def _year_diff(m: dict, today: date) -> int:
     """Years between today and the Douban-recorded year (fall back to eiga year)."""
     y = m.get("douban_year") or m.get("year") or 0
@@ -227,15 +184,17 @@ def _year_diff(m: dict, today: date) -> int:
 #            hide_when_empty (bool).
 # Keys must match SECTION_LABELS in briefing_template.py.
 _SECTION_SPECS: dict[str, dict] = {
-    # 院线热映: chain + recent release + douban_score>0 + NOT classic.
-    # (year filter prevents recent re-releases of old films from doubling up
-    # with 院线经典.)
+    # 院线热映: chain + douban_score>0 + NOT classic（year_diff<=3）+ 上映期窗口：
+    #   制作国只有日本的片 → 上映 6 个月（180天）内；
+    #   非日本片（含合拍）   → 上映 2 年（720天）内（外片在日上映常延迟、放映期长）。
     "院线热映": {
         "predicate": lambda m, today: (
             m.get("category") == "chain"
             and (m.get("douban_score") or 0) > 0
-            and _is_recent_release(m, today, days=365)
             and _year_diff(m, today) <= 3
+            and _is_recent_release(
+                m, today, days=180 if _is_japan_only(m) else 720
+            )
         ),
         "sort_key": lambda m: -(m.get("douban_score") or 0),
         "hide_when_empty": False,
@@ -287,7 +246,7 @@ def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
     # gates them in; everything else is filtered by per-section predicates.
     rows = conn.execute(
         "SELECT mv.movie_id, mv.title_jp, mv.title_original, mv.eiga_url, "
-        "       mv.year, mv.category, mv.release_date, "
+        "       mv.year, mv.country, mv.category, mv.release_date, "
         "       mv.eiga_rating, mv.eiga_rating_count, "
         "       m.douban_id, m.douban_url, m.title_cn AS m_title_cn, "
         "       m.douban_score AS m_score, m.douban_year, "
@@ -438,14 +397,13 @@ def generate_wechat_briefing_md(top_n: int = 5,
         if not movies:
             parts.append(SECTION_EMPTY_PLACEHOLDER + "\n")
             continue
+        # review_source 仍用于选评分行（电影日和用 eiga 评分，其余用豆瓣分）。
         review_source = "eiga" if section_key == "电影日和" else "douban"
         for idx, m in enumerate(movies, 1):
             m["theaters"] = _load_theaters_for_movie(conn, m["movie_id"])
             eiga_url = m.get("eiga_url") or (
                 f"https://eiga.com/movie/{m['movie_id']}/" if m.get("movie_id") else None
             )
-            if review_source == "eiga":
-                m["eiga_reviews"] = _load_eiga_reviews(conn, m["movie_id"])
             parts.append(
                 _briefing_format_movie(idx, m, eiga_url, review_source=review_source) + "\n"
             )

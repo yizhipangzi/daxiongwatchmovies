@@ -17,11 +17,8 @@ from __future__ import annotations
 DATE_FORMAT = "%Y年%m月%d日"
 
 
-# ── Top of the briefing ─────────────────────────────────────────────────────
-# Placeholders: date_str
+# ── Top of the briefing ────────────────────────────
 BRIEFING_HEADER = """\
-# 大熊看点映  {date_str}
-
 > 东京华人电影周报 · 连锁院线 / 独立影院
 """
 
@@ -57,7 +54,6 @@ SECTION_EMPTY_PLACEHOLDER = "（暂无符合条件的电影）"
 #   orig_link  — "[原题](eiga_url)" or plain "原题" if no URL
 #   stats_line — see STATS_* templates below
 #   director, cast, genre — comma-separated strings (or "-")
-#   reviews    — already-formatted review block (multiple lines joined
 #   theaters   — clickable theater list (or "-"))
 MOVIE_BLOCK = """\
 
@@ -67,8 +63,6 @@ MOVIE_BLOCK = """\
 👤 导演 {director}
 🎭 主演 {cast}
 🏷️ 类型 {genre}
-📰 {review_heading}
-{reviews}
 📍 上映影院
 {theaters}\
 """
