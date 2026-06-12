@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 STABLE_TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/stable_token"
 UPLOAD_META_URL = "https://api.weixin.qq.com/tcb/uploadfile"
 DOWNLOAD_META_URL = "https://api.weixin.qq.com/tcb/batchdownloadfile"
+DELETE_URL = "https://api.weixin.qq.com/tcb/batchdeletefile"
 
 # 海外 VM ↔ 腾讯云存储是跨境，慢且偶发卡断。给足超时 + 重试。
 _RETRIES = 3
@@ -103,6 +104,17 @@ def upload(env: str, token: str, cloud_path: str, content: bytes) -> str:
             if attempt < _RETRIES:
                 time.sleep(5 * attempt)
     raise RuntimeError(f"云存储上传重试 {_RETRIES} 次仍失败 ({cloud_path}): {last}")
+
+
+def delete(env: str, token: str, fileid_list: list) -> dict:
+    """批量删除云存储文件。不存在的 fileid 会在返回里标错误，但不影响整批。"""
+    if not fileid_list:
+        return {}
+    r = requests.post(
+        DELETE_URL, params={"access_token": token},
+        json={"env": env, "fileid_list": list(fileid_list)}, timeout=_META_TIMEOUT,
+    )
+    return r.json()
 
 
 def download(env: str, token: str, fileid: str,

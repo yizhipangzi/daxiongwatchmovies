@@ -374,6 +374,12 @@ def main() -> None:
         if sync_on:
             logger.info("Sync: 从云存储拉取最新 eiga.db ...")
             _dbsync.pull_db(config)
+            # cloud：pull 到最新 master 后，先备份一份 eiga-YYYYMMDD.db（保留 7 天，删旧）。
+            if _fetcher.is_cloud():
+                try:
+                    _dbsync.backup_db(config, keep_days=7)
+                except Exception as exc:
+                    logger.warning("备份失败（忽略，不影响主流程）: %s", exc)
             if not _fetcher.is_cloud():
                 stamp = _dbsync.get_cloud_stamp()
                 today_j = _dbsync.today_jst()

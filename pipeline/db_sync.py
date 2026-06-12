@@ -99,6 +99,45 @@ def _clear_wal_siblings(db_path: Path) -> None:
                 pass
 
 
+def backup_db(config: dict, keep_days: int = 7, db_path: Path = DB_PATH) -> Optional[str]:
+    """上传一份 db/backup/eiga-YYYYMMDD.db（gzip）作为当天备份，并删除超过 keep_days
+    天的旧备份。供 cloud 每轮开始时（pull 之后）调用，保留最近 keep_days 天的滚动备份。
+
+    云存储没有「列目录」接口，所以删除用确定性 fileid：按日期构造 keep_days..+30 天前的
+    备份 fileid 批量删（不存在的会被忽略）。返回备份 file_id（失败/无 DB 返回 None）。
+    """
+    mp = wxcloud.mp_cfg(config)
+    env = mp.get("cloud_env", "")
+    if not env:
+        raise RuntimeError("miniprogram.cloud_env 未配置")
+    if not Path(db_path).exists():
+        logger.warning("backup_db: 本地 DB 不存在，跳过备份")
+        return None
+    token = wxcloud.get_access_token(config)
+    _checkpoint_wal(db_path)
+    gz = gzip.compress(Path(db_path).read_bytes(), compresslevel=6)
+    base = datetime.now(timezone(timedelta(hours=9))).date()  # JST
+    backup_path = f"db/backup/eiga-{base.strftime('%Y%m%d')}.db"
+    fid = wxcloud.upload(env, token, backup_path, gz)
+    logger.info("backup_db: 已上传当天备份 %s (%d bytes)", backup_path, len(gz))
+
+    # 删旧备份：用 db_fileid 推出云存储前缀，构造 keep_days..+30 天前的 fileid 批量删。
+    db_fid = _db_fileid(config)
+    cloud_path = _cloud_db_path(config)
+    if db_fid and db_fid.endswith(cloud_path):
+        prefix = db_fid[: -len(cloud_path)]  # cloud://{env}.{bucket}/
+        old_ids = [
+            prefix + f"db/backup/eiga-{(base - timedelta(days=ago)).strftime('%Y%m%d')}.db"
+            for ago in range(keep_days, keep_days + 31)
+        ]
+        try:
+            wxcloud.delete(env, token, old_ids)
+            logger.info("backup_db: 已清理 >%d 天的旧备份（候选 %d 个）", keep_days, len(old_ids))
+        except Exception as exc:
+            logger.warning("backup_db: 清理旧备份失败（忽略）: %s", exc)
+    return fid
+
+
 def push_db(config: dict, db_path: Path = DB_PATH) -> str:
     """上传本地 eiga.db 到云存储，返回 file_id。"""
     mp = wxcloud.mp_cfg(config)
