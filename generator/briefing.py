@@ -191,6 +191,7 @@ _SECTION_SPECS: dict[str, dict] = {
         "predicate": lambda m, today: (
             m.get("category") == "chain"
             and (m.get("douban_score") or 0) > 0
+            and (m.get("watched") or 0) > 1000
             and _year_diff(m, today) <= 3
             and _is_recent_release(
                 m, today, days=180 if _is_japan_only(m) else 720
@@ -204,6 +205,7 @@ _SECTION_SPECS: dict[str, dict] = {
         "predicate": lambda m, today: (
             m.get("category") == "chain"
             and (m.get("douban_score") or 0) > 0
+            and (m.get("watched") or 0) > 1000
             and _year_diff(m, today) > 3
         ),
         "sort_key": lambda m: -(m.get("douban_score") or 0),
@@ -214,6 +216,7 @@ _SECTION_SPECS: dict[str, dict] = {
         "predicate": lambda m, today: (
             m.get("category") == "indie"
             and (m.get("douban_score") or 0) > 0
+            and (m.get("watched") or 0) > 1000
         ),
         "sort_key": lambda m: -(m.get("douban_score") or 0),
         "hide_when_empty": False,
@@ -227,7 +230,7 @@ _SECTION_SPECS: dict[str, dict] = {
             m.get("category") == "chain"
             and (m.get("douban_score") or 0) == 0
             and (m.get("eiga_rating") or 0) > 0
-            and (m.get("eiga_rating_count") or 0) > 50
+            and (m.get("eiga_rating_count") or 0) > 200
             and _is_recent_release(m, today, days=365)
             and _year_diff(m, today) <= 3
         ),
