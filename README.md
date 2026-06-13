@@ -28,7 +28,7 @@
 
 - Step2
   - python step2_api.py run [--no-md] [--delay N]
-    - 已匹配（verified=1）的条目静默跳过，不产生 log、不发请求。
+    - 已匹配（记下了 douban_id，无论自动还是手动）的条目静默跳过，不产生 log、不发请求；一旦匹配上就永不重搜、永不删除（verified 仅作年份/国名校验的参考信息）。
     - 搜索失败过的电影自动加入 douban_skip_list，后续 run 静默跳过，等待手动匹配。
     - --no-md：不生成 MD 报告文件。
   - 产出文件说明：
@@ -71,8 +71,10 @@ douban_url 为空 → 删除该电影的 match 记录，下次 step2 会重新�
 数据库表要点
 
 - run_state: 用于记录 last_run_date（JST ISO 日期）。
-- douban_matches: movie_id -> douban_id / score / votes / verified / matched_at / search_attempts。
-  - verified=1 表示匹配成功（自动或手动），Step2 不会再搜索。
+- douban_matches: movie_id -> douban_id / score / votes / verified / manual / matched_at / search_attempts。
+  - 只要记下了 douban_id（自动或手动）即视为已匹配，Step2 不会再搜索、也不会删除该记录。
+  - verified=1/0 仅表示年份+国名校验是否通过（参考信息），不再触发删除或重搜。
+  - manual=1 表示人工用 manual_set_match 确认的匹配；这类记录受额外保护，连「未匹配清理」也豁免。
   - search_attempts 记录自动搜索失败次数，达到 3 次后 Step2 静默跳过；--rerun-unmatched 可重置。
 - douban_matches_history: 每次抓取的评分快照。
 - douban_details: 手动匹配或 enrich_top_movies 后写入的完整页面数据（导演/演员/短评/预告片等）。

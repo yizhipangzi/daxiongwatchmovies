@@ -312,6 +312,14 @@ def _ensure_douban_table(conn: sqlite3.Connection):
         conn.commit()
     except Exception:
         pass
+    # manual=1 marks a human-confirmed match. Such rows are NEVER re-searched,
+    # demoted, or deleted — the program must not second-guess a manual match
+    # (the operator verifies these by hand). Idempotent for existing DBs.
+    try:
+        conn.execute("ALTER TABLE douban_matches ADD COLUMN manual INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
     # eiga.com 1-5 rating + review count, used by the 电影日和 section.
     # step1 also adds these, but step2 may be invoked standalone (e.g. for
     # briefing-only runs) so we re-assert here.
@@ -462,31 +470,31 @@ def match_movies(categories: tuple = ("chain", "indie"),
     now = datetime.now().isoformat(timespec="seconds")
     today_str = now[:10]
 
-    # Delete wrong-match records (has douban_id but not verified — wrong movie, retry)
-    bad_del = conn.execute(
-        "DELETE FROM douban_matches WHERE verified = 0 AND douban_id IS NOT NULL AND douban_id != ''"
-    ).rowcount
-    # Drop all unmatched records so every run re-attempts them.
-    # Skip-list entries live in douban_skip_list and are handled separately.
+    # 政策：一旦记下了 douban_id（无论自动还是手动），就视为「已匹配」并信任它——
+    # 永不当「疑似错配」删除、永不重搜。verified 退化为纯参考信息（年份/国名是否对得上），
+    # 不再触发删除或重搜。要纠正一个错配，用 manual_set_match 覆盖即可。
+    #
+    # 因此这里只清理「未匹配」（douban_id 为空）记录，让它们每轮重试。
+    # 手动记录（manual=1）一律豁免；skip-list 在 douban_skip_list 单独处理。
     stale_del = conn.execute(
-        "DELETE FROM douban_matches WHERE (douban_id IS NULL OR douban_id = '')"
+        "DELETE FROM douban_matches "
+        "WHERE (douban_id IS NULL OR douban_id = '') AND COALESCE(manual, 0) = 0"
     ).rowcount
-    if bad_del + stale_del:
-        conn.commit()
-    if bad_del:
-        logger.info("Cleared %d wrong-match records for retry", bad_del)
     if stale_del:
+        conn.commit()
         logger.info("Cleared %d unmatched records for retry", stale_del)
 
-    # All verified matches are skipped silently on rerun — no log, no request
+    # 已匹配（有 douban_id）的电影一律静默跳过——不重搜、不发请求。
+    # 不再以 verified 为准：只要匹配上了豆瓣条目就跳过，无论校验是否通过。
     done_ids = set()
     if resume:
         rows = conn.execute(
-            "SELECT movie_id FROM douban_matches WHERE verified = 1"
+            "SELECT movie_id FROM douban_matches "
+            "WHERE douban_id IS NOT NULL AND douban_id != ''"
         ).fetchall()
         done_ids = {r["movie_id"] for r in rows}
         if done_ids:
-            logger.info("Resuming: %d already verified, skipping silently", len(done_ids))
+            logger.info("Resuming: %d already matched, skipping silently", len(done_ids))
 
     # Get movies
     movies = conn.execute(
@@ -928,7 +936,6 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
               JOIN movies mv ON m.movie_id = mv.movie_id
               LEFT JOIN douban_details d ON d.movie_id = m.movie_id
              WHERE m.douban_id IS NOT NULL AND m.douban_id != ''
-               AND m.verified = 1
                AND mv.category IN ({cat_ph})
                AND (
                    m.movie_id IN (
@@ -1353,17 +1360,19 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
             year_e = m.get("year") or "?"
             rank = m.get("rank", "?")
 
-            # Only show douban data for verified matches
-            is_verified = m.get("douban_id") and m.get("verified")
-            if is_verified:
+            # 有 douban_id 即视为已匹配，展示豆瓣数据；其中 verified=0 的记录
+            # 在中文名列前加「疑似错配」标记，方便人工复查（年份/国名没对上）。
+            has_douban = m.get("douban_id")
+            if has_douban:
                 title_cn_raw = (m.get("title_cn") or "-").replace('|', '')
                 score = m.get("douban_score", 0)
                 votes = m.get("douban_votes", 0)
                 director = m.get("director") or "-"
                 cast = m.get("cast") or "-"
                 douban_url = m.get("douban_url", "")
-                title_cn = (f'<a href="{douban_url}" target="_blank">{title_cn_raw}</a>'
-                            if douban_url else title_cn_raw)
+                name_cell = (f'<a href="{douban_url}" target="_blank">{title_cn_raw}</a>'
+                             if douban_url else title_cn_raw)
+                title_cn = name_cell if m.get("verified") else f"疑似错配 {name_cell}"
                 score_str = f"{score:.1f}" if score else "-"
             else:
                 title_cn = ""
@@ -1482,12 +1491,14 @@ def manual_set_match(movie_id: str, douban_id: str, delay: float = 1.5) -> dict:
     year_ok = _check_year_match(mov["year"] or 0, douban_year)
     country_ok = _check_country_match(mov["country"] or "", douban_country)
 
+    # verified=1 + manual=1: a hand-confirmed match. country_ok/year_ok are still
+    # recorded for reference, but they never demote or delete this row afterwards.
     conn.execute(
         """INSERT OR REPLACE INTO douban_matches
            (movie_id, douban_id, title_cn, douban_score, douban_votes,
             director, cast, genre, douban_year, douban_country, douban_url,
-            year_ok, country_ok, verified, matched_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+            year_ok, country_ok, verified, manual, matched_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?)""",
         (movie_id, douban_id, meta.get("title_cn", ""), score, votes,
          meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
          douban_year, douban_country,

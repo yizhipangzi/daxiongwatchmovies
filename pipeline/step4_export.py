@@ -142,9 +142,10 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
     dm = matches.get(mid)
     eiga_rating = g("eiga_rating")
 
-    # 整体二选一：豆瓣匹配成功（有详情，或有 verified 的匹配）→ 评分/想看/看过/
+    # 整体二选一：豆瓣匹配成功（有详情，或匹配到了 douban_id）→ 评分/想看/看过/
     # 类型/导演/演员/短评 全用豆瓣；没匹配到 → 全用 eiga 上的信息。
-    matched = bool(dd) or bool(dm and dm.get("verified"))
+    # 一旦记下 douban_id 即视为已匹配（与 step2 的政策一致，不再以 verified 为准）。
+    matched = bool(dd) or bool(dm and dm.get("douban_id"))
 
     if matched:
         d = dd or {}
