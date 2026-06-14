@@ -113,19 +113,42 @@ def _load_eiga_reviews(conn: sqlite3.Connection, n: int = 3) -> dict:
 
 
 def _load_showtimes(conn: sqlite3.Connection) -> dict:
-    """返回 {(movie_id, theater_id): [{date, times:[...]}]}，按日期分组、时间升序。"""
+    """返回 {(movie_id, theater_id): [{time, movieType:[{type, typeTxt}]}, ...]}，
+    只含系统当天(JST)的场次，时间升序。
+
+    小程序按「今天看什么」展示，不处理日期维度，所以这里只抽取运行当天(JST)的
+    场次。每个场次带上格式标签 movieType（字幕/吹替/IMAX 等，来自 showtimes.movie_type
+    的 JSON）。showtimes 表里保留整周数据，过滤在此完成。
+    """
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
     out: dict = {}
     if not _table_exists(conn, "showtimes"):
         return out
-    grouped: dict = {}
+    # movie_type 列是后加的：老库可能没有，按需探测，避免 SELECT 报错。
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(showtimes)")}
+    has_type = "movie_type" in cols
+    sel = "SELECT movie_id, theater_id, start_time" + (", movie_type" if has_type else "")
     for r in conn.execute(
-        "SELECT movie_id, theater_id, show_date, start_time "
-        "FROM showtimes ORDER BY show_date, start_time"
+        f"{sel} FROM showtimes WHERE show_date = ? ORDER BY start_time",
+        (today,),
     ):
-        key = (r["movie_id"], r["theater_id"])
-        grouped.setdefault(key, {}).setdefault(r["show_date"], []).append(r["start_time"])
-    for key, by_date in grouped.items():
-        out[key] = [{"date": d, "times": ts} for d, ts in by_date.items()]
+        movie_type: list = []
+        if has_type and r["movie_type"]:
+            try:
+                raw = json.loads(r["movie_type"])
+            except Exception:
+                raw = []
+            for x in raw if isinstance(raw, list) else []:
+                if isinstance(x, dict) and x.get("type"):
+                    movie_type.append({
+                        "type": x["type"],
+                        "typeTxt": x.get("type_txt") or x.get("typeTxt") or "",
+                    })
+        out.setdefault((r["movie_id"], r["theater_id"]), []).append({
+            "time": r["start_time"],
+            "movieType": movie_type,
+        })
     return out
 
 
@@ -223,6 +246,10 @@ def build_district(conn: sqlite3.Connection, district: dict,
             continue  # 该影院当前无上映电影 → 不收录
         movies = [_movie_obj(m, t["theater_id"], details, matches, showtimes, eiga_reviews)
                   for m in movie_rows]
+        # 今天(JST)在该影院没有场次的电影不输出（showtimes 已是当天一维数组）
+        movies = [mv for mv in movies if mv["showtimes"]]
+        if not movies:
+            continue  # 该影院今天没有任何排片 → 不收录
         movies.sort(key=lambda x: x["sortScore"], reverse=True)
         theaters_out.append({
             "id": t["theater_id"],

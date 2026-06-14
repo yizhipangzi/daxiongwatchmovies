@@ -115,6 +115,7 @@ def _get_db() -> sqlite3.Connection:
             start_time TEXT NOT NULL,   -- "HH:MM" 24h, zero-padded
             end_time   TEXT,            -- "HH:MM" or NULL
             ticket_url TEXT,            -- 予約リンク or NULL (満席/上映終了 etc.)
+            movie_type TEXT,            -- JSON [{type, type_txt}]: 字幕/吹替/IMAX 等格式标签
             PRIMARY KEY (movie_id, theater_id, show_date, start_time),
             FOREIGN KEY (movie_id) REFERENCES movies(movie_id),
             FOREIGN KEY (theater_id) REFERENCES theaters(theater_id)
@@ -144,6 +145,11 @@ def _get_db() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE movies ADD COLUMN {col_def}")
         except Exception:
             pass
+    # Idempotent ALTER for showtimes.movie_type (added later).
+    try:
+        conn.execute("ALTER TABLE showtimes ADD COLUMN movie_type TEXT")
+    except Exception:
+        pass
     conn.commit()
     return conn
 
@@ -559,51 +565,77 @@ def _scrape_showtimes(movie_id: str, theater_id: str, delay: float = 0.5) -> lis
     URL: /movie-theater/{movie_id}/{theater_id}/ where theater_id is the
     "pref/area/theater" path (e.g. "13/130201/3318").
 
-    The schedule is a <table class="weekly-schedule"> whose <td data-date="YYYYMMDD">
-    cells each hold one day's screenings. Every showtime is a `.btn` element:
+    The page groups screenings by format: each <div class="movie-schedule"> holds
+    one <div class="movie-type"> (the format/audio tags) plus one
+    <table class="weekly-schedule">. Every tag is a <span class="type-XXX">…</span>
+    (type-subtitled 字幕 / type-dubbed 吹替 / type-imax / type-screenx / …) and
+    applies to ALL showtimes in that group's table.
+
+    Each <td data-date="YYYYMMDD"> cell holds one day's screenings. Every showtime
+    is a `.btn` element:
       - <a class="btn ticket…" href="…">14:55<small>～23:35</small></a>  (bookable)
       - <span class="btn off">9:40</span>                               (no link)
     The leading text is the start time; the optional <small> holds the end time.
 
-    Returns a list of dicts: {show_date, start_time, end_time, ticket_url}.
+    Returns a list of dicts: {show_date, start_time, end_time, ticket_url, types}
+    where types = [{"type": "type-imax", "type_txt": "IMAX"}, …]. The same
+    (date, start) appearing in multiple format groups is merged into one slot with
+    the union of its tags (dedup by type class, in first-seen order).
     """
     url = f"https://eiga.com/movie-theater/{movie_id}/{theater_id}/"
     soup = _fetch(url, delay=delay)
     if soup is None:
         return []
 
-    showtimes: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for td in soup.select("table.weekly-schedule td[data-date]"):
-        d = td.get("data-date", "")
-        if len(d) != 8 or not d.isdigit():
-            continue
-        show_date = f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
-        for btn in td.select(".btn"):
-            # The start time is the leading text node, before any <small> end time.
-            lead = btn.find(string=True)
-            start = _norm_time(lead.strip() if lead else "")
-            if not start:
-                continue
-            # Dedup within a theater/day: the same slot can appear twice
-            # (e.g. 字幕 row + 吹替 row collapse to identical start times).
-            key = (show_date, start)
-            if key in seen:
-                continue
-            seen.add(key)
+    by_slot: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for table in soup.select("table.weekly-schedule"):
+        # Tags live in the enclosing group's <div class="movie-type">.
+        grp = table.find_parent("div", class_="movie-schedule")
+        types: list[dict] = []
+        if grp:
+            for span in grp.select("div.movie-type span"):
+                cls = next((c for c in span.get("class", []) if c.startswith("type-")), None)
+                if not cls:
+                    continue
+                txt = span.get_text(strip=True)
+                types.append({"type": cls, "type_txt": txt})
 
-            end = None
-            small = btn.select_one("small")
-            if small:
-                end = _norm_time(re.sub(r"^[～~\s]+", "", small.get_text(strip=True)))
-            href = btn.get("href")
-            showtimes.append({
-                "show_date": show_date,
-                "start_time": start,
-                "end_time": end,
-                "ticket_url": href if href else None,
-            })
-    return showtimes
+        for td in table.select("td[data-date]"):
+            d = td.get("data-date", "")
+            if len(d) != 8 or not d.isdigit():
+                continue
+            show_date = f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+            for btn in td.select(".btn"):
+                # The start time is the leading text node, before any <small> end time.
+                lead = btn.find(string=True)
+                start = _norm_time(lead.strip() if lead else "")
+                if not start:
+                    continue
+                key = (show_date, start)
+                rec = by_slot.get(key)
+                if rec is None:
+                    end = None
+                    small = btn.select_one("small")
+                    if small:
+                        end = _norm_time(re.sub(r"^[～~\s]+", "", small.get_text(strip=True)))
+                    href = btn.get("href")
+                    rec = {
+                        "show_date": show_date,
+                        "start_time": start,
+                        "end_time": end,
+                        "ticket_url": href if href else None,
+                        "types": [],
+                    }
+                    by_slot[key] = rec
+                    order.append(key)
+                # Merge this group's tags into the slot, dedup by type class.
+                seen_types = {t["type"] for t in rec["types"]}
+                for t in types:
+                    if t["type"] not in seen_types:
+                        rec["types"].append(t)
+                        seen_types.add(t["type"])
+    return [by_slot[k] for k in order]
 
 
 def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
@@ -877,10 +909,11 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
                 for s in slots:
                     conn.execute(
                         """INSERT OR REPLACE INTO showtimes
-                           (movie_id, theater_id, show_date, start_time, end_time, ticket_url)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
+                           (movie_id, theater_id, show_date, start_time, end_time, ticket_url, movie_type)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
                         (mid, tid, s["show_date"], s["start_time"],
-                         s["end_time"], s["ticket_url"]),
+                         s["end_time"], s["ticket_url"],
+                         json.dumps(s.get("types") or [], ensure_ascii=False)),
                     )
                 total_slots += len(slots)
             if total_slots:
@@ -1062,6 +1095,55 @@ def backfill_release_dates(categories: Optional[tuple] = None,
     conn.close()
     logger.info("backfill_release_dates: 扫描 %d 部，修正 %d 部", scanned, fixed)
     return scanned, fixed
+
+
+def backfill_showtime_types(delay: float = 0.5, limit: int = 0) -> tuple[int, int]:
+    """回填 showtimes.movie_type：对当前已有排片的 (movie, theater) 重抓场次页，
+    把格式标签（字幕/吹替/IMAX/ScreenX 等）写到对应场次行的 movie_type 列。
+
+    movie_type 列是后加的，老库里的场次行该列为 NULL。step1 主循环有「今天已跑」
+    防抓守卫，当天不会重抓，所以用这个独立回填做一次性迁移。
+
+    只挑 movie_type 仍为 NULL 的 (movie, theater) 对，所以可反复运行/断点续跑
+    （fetcher 冷却用尽会提前停）。只更新 movie_type 列，不动场次时间本身。
+
+    返回 (扫描的 movie-theater 对数, 更新的场次行数)。
+    """
+    conn = _get_db()
+    pairs = conn.execute(
+        "SELECT DISTINCT movie_id, theater_id FROM showtimes "
+        "WHERE movie_type IS NULL ORDER BY movie_id, theater_id"
+    ).fetchall()
+    if limit > 0:
+        pairs = pairs[:limit]
+    logger.info("backfill_showtime_types: %d 对 (movie,theater) 待回填", len(pairs))
+
+    from scraper import fetcher
+    fetcher.reset_state()
+    scanned = updated = 0
+    for p in pairs:
+        if fetcher.exhausted():
+            logger.warning("backfill_showtime_types: 抓取冷却用尽，提前停止"
+                           "（已扫 %d 对，下次续跑）", scanned)
+            break
+        scanned += 1
+        mid, tid = p["movie_id"], p["theater_id"]
+        slots = _scrape_showtimes(mid, tid, delay=delay)
+        for s in slots:
+            cur = conn.execute(
+                "UPDATE showtimes SET movie_type=? "
+                "WHERE movie_id=? AND theater_id=? AND show_date=? AND start_time=?",
+                (json.dumps(s.get("types") or [], ensure_ascii=False),
+                 mid, tid, s["show_date"], s["start_time"]),
+            )
+            updated += cur.rowcount
+        conn.commit()
+        if scanned % 20 == 0:
+            logger.info("backfill_showtime_types: %d/%d 对，已更新 %d 行",
+                        scanned, len(pairs), updated)
+    conn.close()
+    logger.info("backfill_showtime_types: 扫描 %d 对，更新 %d 行", scanned, updated)
+    return scanned, updated
 
 
 # ── MD出力 ───────────────────────────────────────────────────────────────────
