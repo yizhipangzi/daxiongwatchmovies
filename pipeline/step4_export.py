@@ -195,6 +195,10 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
         wish = 0
         comments = eiga_reviews.get(mid, [])  # eiga 短评，最多 3 条
 
+    # 海报：优先 eiga（movies.poster_url，step1 从 /movie/{id}/photo/ 抓的高清图），
+    # eiga 没有时回退豆瓣海报（douban_details.poster_url，step2 从 #mainpic 抓）。
+    poster = g("poster_url") or (dd.get("poster_url") if dd else None) or ""
+
     # sortScore：有豆瓣分用豆瓣分，否则用 eiga 评分(0-5)×2 折算到 10 分制。
     if douban_score and douban_score > 0:
         sort_score = round(float(douban_score), 1)
@@ -219,6 +223,7 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
         "country": g("country") or "",
         "doubanWatched": watched,
         "doubanWish": wish,
+        "poster": poster,
         "doubanComments": comments,
         "showtimes": showtimes.get((mid, theater_id), []),
         "sortScore": sort_score,

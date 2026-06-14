@@ -139,8 +139,10 @@ def _get_db() -> sqlite3.Connection:
     # script = 脚本 (screenwriters, " / " joined); cast_names = 出演者 (actor
     # names, " / " joined — `cast` is a SQL keyword so the column is cast_names).
     # director (監督) column already exists above.
+    # poster_url = 海报图 URL（从电影海报页 /movie/{id}/photo/ 的 .movie-photo img
+    # 抽取并升到高清 /640.jpg）。eiga 没有海报时留空，由 step4 回退到豆瓣海报。
     for col_def in ("eiga_rating REAL", "eiga_rating_count INTEGER",
-                    "script TEXT", "cast_names TEXT"):
+                    "script TEXT", "cast_names TEXT", "poster_url TEXT"):
         try:
             conn.execute(f"ALTER TABLE movies ADD COLUMN {col_def}")
         except Exception:
@@ -530,6 +532,39 @@ def _scrape_movie_detail(movie_id: str, delay: float = 0.5) -> dict:
     return info
 
 
+# 海报 URL 高清化：
+#   .../photo/{hash}.jpg        → .../photo/{hash}/640.jpg
+#   .../photo/{hash}/{size}.jpg → .../photo/{hash}/640.jpg
+_POSTER_SIZED_RE = re.compile(r"(/photo/[0-9a-f]+)/\d+\.(?:jpg|png|webp)")
+_POSTER_PLAIN_RE = re.compile(r"(/photo/[0-9a-f]+)\.jpg")
+
+
+def _hi_res_poster(src: str) -> str:
+    """把 eiga 海报 URL 升到高清 /640.jpg（约 100KB，适配小程序浮层封面）。"""
+    m = _POSTER_SIZED_RE.search(src)
+    if m:
+        return src[:m.start()] + m.group(1) + "/640.jpg"
+    m = _POSTER_PLAIN_RE.search(src)
+    if m:
+        return src[:m.start()] + m.group(1) + "/640.jpg"
+    return src
+
+
+def _scrape_eiga_poster(movie_id: str, delay: float = 0.5) -> Optional[str]:
+    """抓电影海报页 /movie/{id}/photo/，取 <div class="movie-photo"> 下 img 的 src，
+    升到高清 /640.jpg 返回。eiga 没有海报（占位 noimg）或页面取不到时返回 None，
+    交给 step4 回退到豆瓣海报。"""
+    url = f"https://eiga.com/movie/{movie_id}/photo/"
+    soup = _fetch(url, delay=delay)
+    if soup is None:
+        return None
+    el = soup.select_one(".movie-photo img")
+    src = (el.get("src") or "").strip() if el else ""
+    if not src or "noimg" in src:
+        return None
+    return _hi_res_poster(src)
+
+
 def _scrape_theater_list(movie_id: str, delay: float = 0.5) -> list[str]:
     """Fetch '映画館を探す' page for a movie in Tokyo (pref=13), return theater_ids."""
     url = f"https://eiga.com/movie-pref/{movie_id}/13/"
@@ -775,11 +810,12 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
         # were added later, so include them to detect (and backfill) old rows.
         row = conn.execute(
             "SELECT country, title_original, year, duration, release_date, director, "
-            "eiga_rating, eiga_rating_count, script, cast_names FROM movies WHERE title_jp=?",
+            "eiga_rating, eiga_rating_count, script, cast_names, poster_url FROM movies WHERE title_jp=?",
             (title_jp,)
         ).fetchone()
         existing_eiga_rating = row["eiga_rating"] if row else None
         existing_eiga_rating_count = row["eiga_rating_count"] if row else None
+        existing_poster = row["poster_url"] if row else None
 
         # Re-fetch the detail page if any key field is missing: country, eiga_rating
         # (NULL only — 0 is a real "no rating" value), director, or cast. This
@@ -816,6 +852,10 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
                 logger.info(f"[Step1] Re-fetching detail for {title_jp} ({missing} missing)")
             detail = _scrape_movie_detail(mid, delay=delay)
             mov.update(detail)
+
+        # 海报：DB 已有就复用（不重抓）；否则抓一次海报页 /movie/{id}/photo/。
+        # eiga 没有海报时返回 None → 留空，由 step4 回退到豆瓣海报。
+        mov["poster_url"] = existing_poster or _scrape_eiga_poster(mid, delay=delay)
 
         # Get all theaters showing this movie
         theater_ids = _scrape_theater_list(mid, delay=delay)
@@ -856,13 +896,13 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
                 """INSERT INTO movies
                    (movie_id, title_jp, country, title_original, year,
                     duration, release_date, director, rank, category, eiga_url,
-                    eiga_rating, eiga_rating_count, script, cast_names)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    eiga_rating, eiga_rating_count, script, cast_names, poster_url)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (mid, mov["title_jp"], mov.get("country"), mov.get("title_original"),
                  mov.get("year"), mov.get("duration"), mov.get("release_date"),
                  mov.get("director"), mov["rank"], category, mov["eiga_url"],
                  mov.get("eiga_rating"), mov.get("eiga_rating_count"),
-                 mov.get("script"), mov.get("cast")),
+                 mov.get("script"), mov.get("cast"), mov.get("poster_url")),
             )
         else:
             # Full UPDATE so re-fetched detail (country / eiga_rating / etc.)
@@ -880,7 +920,8 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
                        eiga_rating=COALESCE(?, eiga_rating),
                        eiga_rating_count=COALESCE(?, eiga_rating_count),
                        script=COALESCE(?, script),
-                       cast_names=COALESCE(?, cast_names)
+                       cast_names=COALESCE(?, cast_names),
+                       poster_url=COALESCE(?, poster_url)
                      WHERE movie_id=?""",
                 (category, mov["rank"],
                  mov.get("country"), mov.get("title_original"),
@@ -888,6 +929,7 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
                  mov.get("release_date"), mov.get("director"),
                  mov.get("eiga_rating"), mov.get("eiga_rating_count"),
                  mov.get("script"), mov.get("cast"),
+                 mov.get("poster_url"),
                  mid),
             )
 

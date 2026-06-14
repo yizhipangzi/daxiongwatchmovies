@@ -329,6 +329,12 @@ def _ensure_douban_table(conn: sqlite3.Connection):
             conn.commit()
         except Exception:
             pass
+    # douban 海报 URL（#mainpic 的 img src），后加列；作为 eiga 没有海报时的回退。
+    try:
+        conn.execute("ALTER TABLE douban_details ADD COLUMN poster_url TEXT")
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
 
 
@@ -721,6 +727,7 @@ def enrich_top_movies(top_n: int = 15, delay: float = 2.0) -> int:
     )
 
     conn = _get_db()
+    _ensure_douban_table(conn)
     cfg = _load_config()
     douban_cfg = cfg.get("douban", {})
     if douban_cfg:
@@ -785,14 +792,15 @@ def enrich_top_movies(top_n: int = 15, delay: float = 2.0) -> int:
             """INSERT OR REPLACE INTO douban_details
                (movie_id, douban_id, title_cn, douban_score, douban_votes,
                 director, cast, genre, douban_year, douban_country, douban_url,
-                want_to_watch, watched, trailer_urls, short_reviews, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                want_to_watch, watched, trailer_urls, short_reviews, updated_at,
+                poster_url)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (mid, subject_id, meta.get("title_cn", ""), score, votes,
              meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
              douban_year, douban_country,
              f"https://movie.douban.com/subject/{subject_id}/",
              meta.get("want_to_watch", 0) or 0, meta.get("watched", 0) or 0,
-             trailers_json, short_reviews_json, now)
+             trailers_json, short_reviews_json, now, meta.get("poster", ""))
         )
         conn.commit()
         enriched += 1
@@ -863,14 +871,15 @@ def _save_douban_details(conn, mid: str, subject_id: str, soup,
         """INSERT OR REPLACE INTO douban_details
            (movie_id, douban_id, title_cn, douban_score, douban_votes,
             director, cast, genre, douban_year, douban_country, douban_url,
-            want_to_watch, watched, trailer_urls, short_reviews, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            want_to_watch, watched, trailer_urls, short_reviews, updated_at,
+            poster_url)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (mid, subject_id, meta.get("title_cn", ""), score, votes,
          meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
          douban_year, douban_country,
          f"https://movie.douban.com/subject/{subject_id}/",
          meta.get("want_to_watch", 0) or 0, meta.get("watched", 0) or 0,
-         trailers_json, short_reviews_json, now)
+         trailers_json, short_reviews_json, now, meta.get("poster", ""))
     )
     return meta
 
@@ -931,7 +940,8 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
         f"""SELECT m.movie_id, m.douban_id, mv.title_jp,
                    mv.year AS movie_year, mv.country AS movie_country,
                    d.updated_at AS details_at,
-                   d.title_cn AS d_title_cn, d.director AS d_director
+                   d.title_cn AS d_title_cn, d.director AS d_director,
+                   d.poster_url AS d_poster
               FROM douban_matches m
               JOIN movies mv ON m.movie_id = mv.movie_id
               LEFT JOIN douban_details d ON d.movie_id = m.movie_id
@@ -955,7 +965,9 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
             return True
         # 在窗口内但内容是空的（旧逻辑可能存过空行）→ 仍要重抓，确保取到真数据。
         empty = not (r["d_title_cn"] or "").strip() and not (r["d_director"] or "").strip()
-        return empty
+        # 海报是后加字段：窗口内但还没抓到海报 → 也重抓一次补上（一次性回填）。
+        no_poster = not (r["d_poster"] or "").strip()
+        return empty or no_poster
 
     targets = [r for r in rows if _needs_fetch(r)]
     skipped_fresh = len(rows) - len(targets)
@@ -1200,14 +1212,15 @@ def enrich_for_briefing(top_n: int = 5, delay: float = 2.0) -> int:
             """INSERT OR REPLACE INTO douban_details
                (movie_id, douban_id, title_cn, douban_score, douban_votes,
                 director, cast, genre, douban_year, douban_country, douban_url,
-                want_to_watch, watched, trailer_urls, short_reviews, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                want_to_watch, watched, trailer_urls, short_reviews, updated_at,
+                poster_url)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (mid, subject_id, meta.get("title_cn", ""), score, votes,
              meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
              douban_year, douban_country,
              f"https://movie.douban.com/subject/{subject_id}/",
              meta.get("want_to_watch", 0) or 0, meta.get("watched", 0) or 0,
-             trailers_json, short_reviews_json, now)
+             trailers_json, short_reviews_json, now, meta.get("poster", ""))
         )
         conn.commit()
         enriched += 1
@@ -1517,14 +1530,15 @@ def manual_set_match(movie_id: str, douban_id: str, delay: float = 1.5) -> dict:
         """INSERT OR REPLACE INTO douban_details
            (movie_id, douban_id, title_cn, douban_score, douban_votes,
             director, cast, genre, douban_year, douban_country, douban_url,
-            want_to_watch, watched, trailer_urls, short_reviews, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            want_to_watch, watched, trailer_urls, short_reviews, updated_at,
+            poster_url)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (movie_id, douban_id, meta.get("title_cn", ""), score, votes,
          meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
          douban_year, douban_country,
          f"https://movie.douban.com/subject/{douban_id}/",
          meta.get("want_to_watch", 0) or 0, meta.get("watched", 0) or 0,
-         trailers_json, short_reviews_json, now)
+         trailers_json, short_reviews_json, now, meta.get("poster", ""))
     )
     conn.commit()
     conn.close()

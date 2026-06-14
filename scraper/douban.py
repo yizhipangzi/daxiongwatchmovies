@@ -1202,6 +1202,14 @@ def _parse_meta(soup: BeautifulSoup) -> dict:
             trailers.append(href)
     info["trailers"] = trailers[:5]
 
+    # --- Poster (海报) ---
+    # 豆瓣条目页左上角 #mainpic 里的 <img> 就是海报，src 形如
+    # https://img9.doubanio.com/view/photo/s_ratio_poster/public/p2879886456.jpg
+    # 作为 eiga.com 没有海报时的回退来源。
+    poster_el = soup.select_one("#mainpic img")
+    if poster_el and poster_el.get("src"):
+        info["poster"] = poster_el["src"].strip()
+
     return info
 
 
