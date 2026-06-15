@@ -641,7 +641,17 @@ def _scrape_showtimes(movie_id: str, theater_id: str, delay: float = 0.5) -> lis
             if len(d) != 8 or not d.isdigit():
                 continue
             show_date = f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
-            for btn in td.select(".btn"):
+            # Normal theaters render each showtime as a `.btn` (bookable <a> or
+            # unbookable <span class="btn off">). 名画座/revival houses without
+            # online ticketing instead list bare <span>HH:MM</span> as direct
+            # children of the <td> (the date label is inside <p class="date">, so
+            # recursive=False excludes it). Fall back to those so these theaters
+            # don't end up with zero showtimes.
+            slot_els = td.select(".btn")
+            if not slot_els:
+                slot_els = [sp for sp in td.find_all("span", recursive=False)
+                            if _TIME_RE.match(sp.get_text(strip=True))]
+            for btn in slot_els:
                 # The start time is the leading text node, before any <small> end time.
                 lead = btn.find(string=True)
                 start = _norm_time(lead.strip() if lead else "")

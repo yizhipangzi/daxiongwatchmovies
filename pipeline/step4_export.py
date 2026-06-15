@@ -128,7 +128,8 @@ def _load_showtimes(conn: sqlite3.Connection) -> dict:
     # movie_type 列是后加的：老库可能没有，按需探测，避免 SELECT 报错。
     cols = {r[1] for r in conn.execute("PRAGMA table_info(showtimes)")}
     has_type = "movie_type" in cols
-    sel = "SELECT movie_id, theater_id, start_time" + (", movie_type" if has_type else "")
+    sel = ("SELECT movie_id, theater_id, start_time, ticket_url"
+           + (", movie_type" if has_type else ""))
     for r in conn.execute(
         f"{sel} FROM showtimes WHERE show_date = ? ORDER BY start_time",
         (today,),
@@ -148,6 +149,9 @@ def _load_showtimes(conn: sqlite3.Connection) -> dict:
         out.setdefault((r["movie_id"], r["theater_id"]), []).append({
             "time": r["start_time"],
             "movieType": movie_type,
+            # 该场次是否可在线购票（有预约链接=可购）。名画座等无在线购票的场次为
+            # false，小程序据此让该场次不可点击复制链接。
+            "onlineTicket": bool(r["ticket_url"]),
         })
     return out
 
