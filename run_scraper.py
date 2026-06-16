@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -381,15 +382,19 @@ def main() -> None:
                 except Exception as exc:
                     logger.warning("备份失败（忽略，不影响主流程）: %s", exc)
             if not _fetcher.is_cloud():
-                stamp = _dbsync.get_cloud_stamp()
+                # 本地必须等 cloud VM 当天跑完（DB 标记==今天）。没到就每 5 分钟
+                # 重新 pull 一次再判，直到 DB 文件符合今天日期戳才跳出继续。
                 today_j = _dbsync.today_jst()
-                if stamp != today_j:
-                    logger.error("本地中止：cloud VM 今天(%s)尚未成功跑完（DB 标记=%s）",
-                                 today_j, stamp)
-                    print(f"\n[ERROR] cloud VM 今天({today_j})还没跑成功"
-                          f"（数据库标记={stamp}）——本地不执行，"
-                          f"请等 cloud 凌晨任务完成后再跑。\n")
-                    sys.exit(1)
+                stamp = _dbsync.get_cloud_stamp()
+                while stamp != today_j:
+                    logger.warning("本地等待：cloud VM 今天(%s)尚未跑完（DB 标记=%s），"
+                                   "5 分钟后重新拉取重试 ...", today_j, stamp)
+                    print(f"[WAIT] cloud VM 今天({today_j})还没跑成功"
+                          f"（数据库标记={stamp}），5 分钟后重试 ...")
+                    time.sleep(300)
+                    _dbsync.pull_db(config)
+                    stamp = _dbsync.get_cloud_stamp()
+                logger.info("本地：cloud VM 今天(%s)已跑完，继续后续处理。", today_j)
             fp_start = _dbsync.db_fingerprint()
 
         # Use eiga.com pipeline only: register theaters and scrape now-showing movies
