@@ -171,8 +171,110 @@ def push_db(config: dict, db_path: Path = DB_PATH) -> str:
     return fid
 
 
+def _snapshot_manual_data(db_path: Path) -> dict:
+    """覆盖本地库前，抓下本地「人工干预数据」：
+      - douban_matches.manual=1（手动匹配）及其 douban_details
+      - douban_skip_list（手动标「无豆瓣条目」的跳过名单）
+
+    整库 pull 是文件级覆盖，会连本地刚做、还没 push 到云端的这些操作一起冲掉。
+    这里先快照，pull 完再回灌（见 _restore_manual_data），让人工干预在任何
+    同步时序下都不丢——你的流程「manual-set/skip-add 后直接跑 run_scraper」
+    全靠这一步：run_scraper 开头的 pull 不会再把它们冲掉。
+    本地库不存在 / 表还没建 → 返回空，照常覆盖。
+    """
+    snap = {"matches": [], "details": [], "skips": []}
+    if not Path(db_path).exists():
+        return snap
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        def _safe(sql, params=()):
+            try:
+                return [dict(r) for r in conn.execute(sql, params).fetchall()]
+            except Exception:
+                return []  # 表还没建（旧库/首次）→ 当作空
+
+        try:
+            snap["matches"] = _safe(
+                "SELECT * FROM douban_matches WHERE COALESCE(manual, 0) = 1")
+            mids = [m["movie_id"] for m in snap["matches"]]
+            if mids:
+                ph = ",".join("?" for _ in mids)
+                snap["details"] = _safe(
+                    f"SELECT * FROM douban_details WHERE movie_id IN ({ph})", mids)
+            snap["skips"] = _safe("SELECT * FROM douban_skip_list")
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("pull_db: 快照人工干预数据失败（忽略，照常覆盖）: %s", exc)
+    return snap
+
+
+def _restore_manual_data(db_path: Path, snap: dict) -> int:
+    """pull 覆盖后，把本地人工干预数据回灌进新库（本地优先：无条件 INSERT OR REPLACE）。
+
+    返回回灌的手动匹配条数（用于日志）。
+    """
+    matches = snap.get("matches") or []
+    details = snap.get("details") or []
+    skips = snap.get("skips") or []
+    if not (matches or skips):
+        return 0
+    restored = 0
+    skips_n = 0
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        def _cols(table: str) -> set:
+            return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+        def _upsert(table: str, rows: list) -> int:
+            if not rows:
+                return 0
+            try:
+                valid = _cols(table)
+            except Exception:
+                return 0  # 目标库没这张表 → 跳过（不致命）
+            if not valid:
+                return 0
+            n = 0
+            for row in rows:
+                keys = [k for k in row.keys() if k in valid]
+                if not keys:
+                    continue
+                ph = ",".join("?" for _ in keys)
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table} ({','.join(keys)}) VALUES ({ph})",
+                    [row[k] for k in keys],
+                )
+                n += 1
+            return n
+
+        try:
+            restored = _upsert("douban_matches", matches)
+            _upsert("douban_details", details)
+            skips_n = _upsert("douban_skip_list", skips)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        # 回灌失败不致命，但要醒目报警（人工数据仍在云端/下次 pull 还能重试）。
+        logger.error("pull_db: 回灌人工干预数据失败！请检查: %s", exc)
+        return 0
+    if restored or skips_n:
+        logger.info("pull_db: 已保留本地人工干预（手动匹配 %d 条、跳过名单 %d 条，本地优先）",
+                    restored, skips_n)
+    return restored
+
+
 def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
-    """从云存储下载 eiga.db 覆盖本地。云上还没有则返回 False（首次需先 init/push）。"""
+    """从云存储下载 eiga.db 覆盖本地。云上还没有则返回 False（首次需先 init/push）。
+
+    覆盖前会快照本地手动匹配 (manual=1)，覆盖后回灌，避免整库同步把本地刚做、
+    尚未 push 的手动匹配冲掉（本地优先）。
+    """
     mp = wxcloud.mp_cfg(config)
     env = mp.get("cloud_env", "")
     if not env:
@@ -204,6 +306,8 @@ def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
     if content[:2] == b"\x1f\x8b":
         content = gzip.decompress(content)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    # 覆盖前快照本地人工干预数据，覆盖后回灌（见 _snapshot/_restore_manual_data）。
+    manual_snap = _snapshot_manual_data(db_path)
     # 先写临时文件再原子替换，避免写一半损坏。
     with tempfile.NamedTemporaryFile(dir=str(Path(db_path).parent), delete=False) as tf:
         tmp = Path(tf.name)
@@ -211,6 +315,7 @@ def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
     shutil.move(str(tmp), str(db_path))
     _clear_wal_siblings(db_path)  # 清掉旧 -wal/-shm，防止覆盖后不一致
     logger.info("pull_db: 云存储 → %s (%d bytes)", db_path, len(content))
+    _restore_manual_data(db_path, manual_snap)
     return True
 
 
