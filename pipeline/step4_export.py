@@ -12,6 +12,7 @@ miniprogram 段（app_id / app_secret / cloud_env）。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -329,6 +330,20 @@ def upload_all(config: dict, local_files: list[Path]) -> dict:
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 
+def write_manifest(files: list[Path], out_dir: Path) -> Path:
+    """生成版本清单 manifest.json：{区id: 该区 JSON 的内容哈希}。
+
+    小程序打开某区前先秒下这个极小文件，比对本地缓存的哈希：一致则用缓存秒开，
+    不一致（含 JSON 出错后重跑 rerun 覆盖、内容变化）才下载整包。哈希取自文件
+    实际字节，故内容不变就不变——rerun 出相同内容不会触发无谓的重新下载。
+    """
+    manifest = {p.stem: hashlib.md5(p.read_bytes()).hexdigest() for p in files}
+    mp = out_dir / "manifest.json"
+    mp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    logger.info("Step4: 已写版本清单 manifest.json（%d 个区）", len(manifest))
+    return mp
+
+
 def run(config: dict, out_dir: Path, upload: bool = True) -> dict:
     """生成 9 个区 JSON 写本地；upload=True 时再上传到云存储。
 
@@ -336,7 +351,10 @@ def run(config: dict, out_dir: Path, upload: bool = True) -> dict:
     """
     data = build_all()
     files = write_local(data, out_dir)
-    result = {"files": [str(p) for p in files], "file_ids": {}}
+    # 版本清单随同上传，供小程序判断缓存是否需要更新（含 rerun 覆盖）。
+    manifest_path = write_manifest(files, out_dir)
+    all_files = files + [manifest_path]
+    result = {"files": [str(p) for p in all_files], "file_ids": {}}
     if upload:
-        result["file_ids"] = upload_all(config, files)
+        result["file_ids"] = upload_all(config, all_files)
     return result
