@@ -683,6 +683,117 @@ def _scrape_showtimes(movie_id: str, theater_id: str, delay: float = 0.5) -> lis
     return [by_slot[k] for k in order]
 
 
+# ── 操作3: 映画館ページから未登録映画を検出・登記 ─────────────────────────
+
+def _next_unlisted_id(conn: sqlite3.Connection) -> str:
+    """Return the next available 99999xxx movie ID for unlisted movies."""
+    row = conn.execute(
+        "SELECT MAX(CAST(movie_id AS INTEGER)) FROM movies WHERE movie_id GLOB '99999*'"
+    ).fetchone()
+    base = row[0] if (row and row[0]) else 999990000
+    return str(base + 1)
+
+
+def _scrape_theater_for_unlisted(theater_id: str, delay: float = 0.5) -> list[dict]:
+    """Scrape a theater's own schedule page for movies not in eiga.com's database.
+
+    On eiga.com's theater page each movie section starts with an h2:
+      - <h2 class="title-xlarge ..."><a href="/movie/ID/">title</a></h2>  ← in DB
+      - <h2 class="title-xlarge ...">title</h2>                           ← NOT in DB
+
+    Walks the page in document order, grouping div.movie-schedule blocks under
+    their preceding h2.  Returns [{title_jp, showtimes}] for unlisted sections only.
+    showtimes format is identical to _scrape_showtimes output.
+    """
+    url = f"https://eiga.com/theater/{theater_id}/"
+    soup = _fetch(url, delay=delay)
+    if soup is None:
+        return []
+
+    # Walk page in document order, bucket schedule-divs under their h2.
+    # soup.select() returns elements in document order.
+    sections: list[tuple] = []   # [(h2_el, [sched_div, ...])]
+    current_h2 = None
+    current_scheds: list = []
+    for el in soup.select("h2.title-xlarge, div.movie-schedule"):
+        if el.name == "h2":
+            if current_h2 is not None:
+                sections.append((current_h2, list(current_scheds)))
+            current_h2 = el
+            current_scheds = []
+        else:
+            current_scheds.append(el)
+    if current_h2 is not None:
+        sections.append((current_h2, current_scheds))
+
+    results = []
+    for h2, scheds in sections:
+        if h2.select_one("a"):
+            continue  # has a link → already in eiga.com's DB
+        title = h2.get_text(strip=True)
+        if not title or len(title) < 2:
+            continue
+
+        # Parse showtimes — same structure as _scrape_showtimes but sourced from
+        # the theater overview page instead of the per-movie-theater page.
+        by_slot: dict[tuple[str, str], dict] = {}
+        order: list[tuple[str, str]] = []
+        for sched in scheds:
+            types: list[dict] = []
+            for span in sched.select("div.movie-type span"):
+                cls = next(
+                    (c for c in span.get("class", []) if c.startswith("type-")), None
+                )
+                if not cls:
+                    continue
+                types.append({"type": cls, "type_txt": span.get_text(strip=True)})
+
+            for table in sched.select("table.weekly-schedule"):
+                for td in table.select("td[data-date]"):
+                    d = td.get("data-date", "")
+                    if len(d) != 8 or not d.isdigit():
+                        continue
+                    show_date = f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+                    slot_els = td.select(".btn")
+                    if not slot_els:
+                        slot_els = [
+                            sp for sp in td.find_all("span", recursive=False)
+                            if _TIME_RE.match(sp.get_text(strip=True))
+                        ]
+                    for btn in slot_els:
+                        lead = btn.find(string=True)
+                        start = _norm_time(lead.strip() if lead else "")
+                        if not start:
+                            continue
+                        key = (show_date, start)
+                        rec = by_slot.get(key)
+                        if rec is None:
+                            end = None
+                            small = btn.select_one("small")
+                            if small:
+                                end = _norm_time(
+                                    re.sub(r"^[～~\s]+", "", small.get_text(strip=True))
+                                )
+                            href = btn.get("href")
+                            rec = {
+                                "show_date": show_date,
+                                "start_time": start,
+                                "end_time": end,
+                                "ticket_url": href if href else None,
+                                "types": [],
+                            }
+                            by_slot[key] = rec
+                            order.append(key)
+                        seen = {t["type"] for t in rec["types"]}
+                        for t in types:
+                            if t["type"] not in seen:
+                                rec["types"].append(t)
+                                seen.add(t["type"])
+
+        results.append({"title_jp": title, "showtimes": [by_slot[k] for k in order]})
+    return results
+
+
 def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
     """操作2: Scrape ALL now-showing movies, classify as chain/indie/other.
 
@@ -1002,6 +1113,58 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
         # 每部抓完立刻落库：免费云中途被杀也已保存，重跑跳过本部。
         conn.commit()
 
+    # 操作3: 各インディー映画館ページから未登録映画（h2 without <a>）を検出・登記。
+    # 99999xxx 仮 ID を採番。eiga.com に正式登録されたら手動で ID を更新できる。
+    theater_cat_map = {
+        row["theater_id"]: row["category"]
+        for row in conn.execute("SELECT theater_id, category FROM theaters").fetchall()
+    }
+    unlisted_total = 0
+    for tid in sorted(indie_tids):
+        if fetcher.exhausted():
+            logger.info("Step1 unlisted scan: fetcher exhausted, stopping")
+            break
+        theater_row = conn.execute(
+            "SELECT name FROM theaters WHERE theater_id=?", (tid,)
+        ).fetchone()
+        theater_name = theater_row["name"] if theater_row else tid
+        unlisted = _scrape_theater_for_unlisted(tid, delay=delay)
+        for u in unlisted:
+            title_jp = u["title_jp"]
+            existing = conn.execute(
+                "SELECT movie_id FROM movies WHERE title_jp=?", (title_jp,)
+            ).fetchone()
+            if existing:
+                mid = existing["movie_id"]
+            else:
+                mid = _next_unlisted_id(conn)
+                conn.execute(
+                    "INSERT INTO movies (movie_id, title_jp, category, eiga_url) VALUES (?,?,?,NULL)",
+                    (mid, title_jp, theater_cat_map.get(tid, "indie")),
+                )
+                unlisted_total += 1
+                logger.info("[unlisted] %s → %s | id=%s", theater_name, title_jp, mid)
+            conn.execute(
+                "INSERT OR IGNORE INTO screenings (movie_id, theater_id) VALUES (?,?)",
+                (mid, tid),
+            )
+            if scrape_showtimes and u["showtimes"]:
+                conn.execute(
+                    "DELETE FROM showtimes WHERE movie_id=? AND theater_id=?", (mid, tid)
+                )
+                for s in u["showtimes"]:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO showtimes
+                           (movie_id, theater_id, show_date, start_time, end_time, ticket_url, movie_type)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        (mid, tid, s["show_date"], s["start_time"],
+                         s["end_time"], s["ticket_url"],
+                         json.dumps(s.get("types") or [], ensure_ascii=False)),
+                    )
+            conn.commit()
+    if unlisted_total:
+        logger.info("Step1: registered %d new unlisted movies (99999xxx IDs)", unlisted_total)
+
     conn.commit()
     conn.close()
 
@@ -1196,6 +1359,87 @@ def backfill_showtime_types(delay: float = 0.5, limit: int = 0) -> tuple[int, in
     conn.close()
     logger.info("backfill_showtime_types: 扫描 %d 对，更新 %d 行", scanned, updated)
     return scanned, updated
+
+
+def remap_unlisted_id(old_id: str, new_id: str, delay: float = 0.5) -> dict:
+    """Promote a 99999xxx temp ID to its real eiga.com movie ID.
+
+    Call this once eiga.com adds the movie to their database.  The function:
+      1. Verifies old_id exists and looks like a 99999xxx entry.
+      2. Fetches fresh metadata from eiga.com using new_id.
+      3. Inserts a new movies row (new_id) with the real metadata, preserving
+         category / screening / showtime / douban data from the old row.
+      4. Re-parents all child rows (screenings, showtimes, snapshots,
+         douban_matches, douban_details, douban_matches_history,
+         douban_skip_list, eiga_reviews) to new_id.
+      5. Deletes the old 99999xxx row.
+
+    Returns a summary dict.  Raises ValueError on bad input, RuntimeError if
+    the eiga.com detail page cannot be fetched.
+    """
+    conn = _get_db()
+
+    old_row = conn.execute("SELECT * FROM movies WHERE movie_id=?", (old_id,)).fetchone()
+    if not old_row:
+        conn.close()
+        raise ValueError(f"movie_id '{old_id}' not found in movies table")
+    if not str(old_id).startswith("99999"):
+        conn.close()
+        raise ValueError(f"'{old_id}' does not look like a 99999xxx temp ID")
+    if conn.execute("SELECT 1 FROM movies WHERE movie_id=?", (new_id,)).fetchone():
+        conn.close()
+        raise ValueError(f"new_id '{new_id}' already exists in movies table")
+
+    # Fetch real metadata from eiga.com
+    detail = _scrape_movie_detail(new_id, delay=delay)
+    poster = _scrape_eiga_poster(new_id, delay=delay)
+
+    old = dict(old_row)
+    conn.execute(
+        """INSERT INTO movies
+           (movie_id, title_jp, country, title_original, year, duration,
+            release_date, director, rank, category, eiga_url,
+            eiga_rating, eiga_rating_count, script, cast_names, poster_url)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (new_id,
+         old["title_jp"],
+         detail.get("country") or old.get("country"),
+         detail.get("title_original") or old.get("title_original"),
+         detail.get("year") or old.get("year"),
+         detail.get("duration") or old.get("duration"),
+         detail.get("release_date") or old.get("release_date"),
+         detail.get("director") or old.get("director"),
+         old.get("rank"),
+         old.get("category"),
+         f"https://eiga.com/movie/{new_id}/",
+         detail.get("eiga_rating") or old.get("eiga_rating"),
+         detail.get("eiga_rating_count") or old.get("eiga_rating_count"),
+         detail.get("script") or old.get("script"),
+         detail.get("cast") or old.get("cast_names"),
+         poster or old.get("poster_url")),
+    )
+
+    # Re-parent all child tables (SQLite FKs are advisory; update manually).
+    for table in ("screenings", "showtimes", "movie_snapshots",
+                  "douban_matches", "douban_details", "douban_matches_history",
+                  "douban_skip_list", "eiga_reviews"):
+        try:
+            conn.execute(f"UPDATE {table} SET movie_id=? WHERE movie_id=?", (new_id, old_id))
+        except Exception:
+            pass  # table may not exist in older DBs
+
+    conn.execute("DELETE FROM movies WHERE movie_id=?", (old_id,))
+    conn.commit()
+    conn.close()
+
+    logger.info("remap_unlisted_id: %s → %s (%s)", old_id, new_id, old["title_jp"])
+    return {
+        "old_id": old_id,
+        "new_id": new_id,
+        "title_jp": old["title_jp"],
+        "eiga_url": f"https://eiga.com/movie/{new_id}/",
+        "detail_fetched": bool(detail),
+    }
 
 
 # ── MD出力 ───────────────────────────────────────────────────────────────────
