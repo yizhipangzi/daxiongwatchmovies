@@ -760,6 +760,10 @@ def _scrape_theater_for_unlisted(theater_id: str, delay: float = 0.5) -> list[di
                             sp for sp in td.find_all("span", recursive=False)
                             if _TIME_RE.match(sp.get_text(strip=True))
                         ]
+                    # 未登録映画は <a class="official" data-time="...">HH:MM～HH:MM</a>
+                    # 形式で排片が表示される（.btn ではない）。
+                    if not slot_els:
+                        slot_els = td.select("a.official")
                     for btn in slot_els:
                         lead = btn.find(string=True)
                         start = _norm_time(lead.strip() if lead else "")
@@ -774,6 +778,11 @@ def _scrape_theater_for_unlisted(theater_id: str, delay: float = 0.5) -> list[di
                                 end = _norm_time(
                                     re.sub(r"^[～~\s]+", "", small.get_text(strip=True))
                                 )
+                            # a.official のテキストは "HH:MM～HH:MM" 形式
+                            if end is None:
+                                em = re.search(r"[～~](\d{1,2}:\d{2})", btn.get_text(strip=True))
+                                if em:
+                                    end = _norm_time(em.group(1))
                             href = btn.get("href")
                             rec = {
                                 "show_date": show_date,
