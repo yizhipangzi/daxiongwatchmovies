@@ -651,6 +651,10 @@ def _scrape_showtimes(movie_id: str, theater_id: str, delay: float = 0.5) -> lis
             if not slot_els:
                 slot_els = [sp for sp in td.find_all("span", recursive=False)
                             if _TIME_RE.match(sp.get_text(strip=True))]
+            # 一部の映画館は <a class="official" data-time="...">HH:MM～HH:MM</a>
+            # 形式で排片を表示する（.btn ではない）。
+            if not slot_els:
+                slot_els = td.select("a.official")
             for btn in slot_els:
                 # The start time is the leading text node, before any <small> end time.
                 lead = btn.find(string=True)
@@ -664,6 +668,11 @@ def _scrape_showtimes(movie_id: str, theater_id: str, delay: float = 0.5) -> lis
                     small = btn.select_one("small")
                     if small:
                         end = _norm_time(re.sub(r"^[～~\s]+", "", small.get_text(strip=True)))
+                    # a.official のテキストは "HH:MM～HH:MM" 形式
+                    if end is None:
+                        em = re.search(r"[～~](\d{1,2}:\d{2})", btn.get_text(strip=True))
+                        if em:
+                            end = _norm_time(em.group(1))
                     href = btn.get("href")
                     rec = {
                         "show_date": show_date,
