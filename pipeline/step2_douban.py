@@ -1034,10 +1034,17 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
             if meta.get("is_tv"):
                 tracker.record_success()
                 continue
-            # 空页面（bot/sorry）：_save_douban_details 已判定并**未入库**，
-            # 这里只记失败 + 跳过，下次重试（确保最终取到，step4 才有数据）。
+            # 空页面（bot/sorry）：_save_douban_details 已判定并**未入库**。
+            # cloud：IP 已被 block，继续请求毫无意义，直接终止本次 enrich。
+            # local：Playwright fallback 已尝试（见 _fetch_movie_page），仍空则下次重试。
             if meta.get("empty"):
                 tracker.record_failure()
+                if keep_going:
+                    logger.warning(
+                        "Full enrich [%d/%d]: 空页面 id=%s — cloud IP blocked，终止本次 enrich",
+                        idx, len(targets), subject_id,
+                    )
+                    break
                 logger.warning("Full enrich [%d/%d]: 空页面 id=%s — 未入库，下次重试",
                                idx, len(targets), subject_id)
                 continue

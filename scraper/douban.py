@@ -337,17 +337,36 @@ def _douban_get(url: str, params: Optional[dict] = None,
 
 def _fetch_movie_page(subject_id: str, delay: float = 1.5,
                       max_retries: int = 3) -> Optional[BeautifulSoup]:
-    """Fetch a Douban movie subject page via requests."""
+    """Fetch a Douban movie subject page.
+
+    Tries requests first; if the response looks like a bot/sorry page
+    (div#content absent), falls back to the same Playwright browser
+    context used for search — handles bot checks and saves fresh cookies.
+    """
     url = f"{MOVIE_BASE}/{subject_id}/"
     sess = _get_session()
     prev_referer = sess.headers.get("Referer", "https://movie.douban.com/")
-    # Simulate navigating from search results to movie page
     sess.headers["Referer"] = "https://movie.douban.com/search?cat=1002"
     resp = _douban_get(url, delay=delay, retries=max_retries)
     sess.headers["Referer"] = prev_referer
     if resp is None:
         return None
-    return BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(resp.text, "lxml")
+    # Real movie pages always have div#content; absence means bot/sorry page.
+    # Playwright fallback is local-only (cloud has no browser, and IP is blocked anyway).
+    if soup.select_one("div#content") is None:
+        try:
+            from scraper import fetcher as _fetcher
+            _is_cloud = _fetcher.is_cloud()
+        except Exception:
+            _is_cloud = False
+        if not _is_cloud:
+            logger.info(
+                "_fetch_movie_page: requests got bot/empty page for id=%s — Playwright fallback",
+                subject_id,
+            )
+            return _fetch_movie_page_playwright(subject_id, delay=delay)
+    return soup
 
 
 def _search_suggest(q: str, year: int = 0,
@@ -743,6 +762,40 @@ def _search_web_playwright(q: str, year: int = 0) -> Optional[dict]:
         return None
     except Exception as exc:
         logger.warning("Playwright search error for %r: %s", q, exc)
+        return None
+
+
+def _fetch_movie_page_playwright(subject_id: str, delay: float = 1.5) -> Optional[BeautifulSoup]:
+    """Playwright fallback for fetching a Douban movie detail page.
+
+    Uses the same browser context as _search_web_playwright, handles bot
+    checks, and saves fresh cookies back to config so the requests session
+    also benefits immediately.
+    """
+    ctx = _ensure_pw_context()
+    if ctx is None:
+        logger.debug("Playwright context unavailable — skipping movie page fallback")
+        return None
+
+    url = f"{MOVIE_BASE}/{subject_id}/"
+    logger.info("Douban Playwright enrich: %s", url)
+    try:
+        page = ctx.new_page()
+        page.bring_to_front()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            _handle_bot_check(page)
+            time.sleep(random.uniform(delay, delay * 1.5))
+            html = page.content()
+        finally:
+            page.close()
+        return BeautifulSoup(html, "lxml")
+    except TimeoutError as exc:
+        logger.warning("Playwright: bot-check timed out for id=%s — closing context (%s)", subject_id, exc)
+        _close_pw_state()
+        return None
+    except Exception as exc:
+        logger.warning("Playwright: enrich error for id=%s: %s", subject_id, exc)
         return None
 
 
