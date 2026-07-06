@@ -230,40 +230,31 @@ def init_douban_session(config: dict) -> None:
 
 
 def _refresh_session_cookie() -> bool:
-    """On 403: try to grab a fresh cookie from the local browser, update session.
+    """On 403: read fresh cookies from .playwright_profile (headless) and reload session.
 
-    Tries playwright_profile first (headless, no Chrome kill), then falls
-    back to reading from the real Chrome profile.
+    Cloud: skip entirely — IP-level blocks can't be fixed by rotating cookies.
+    Local: 403 means Playwright will handle the full login flow; this is just a
+    quick attempt to load already-saved cookies before falling back to Playwright.
 
     Returns True if a logged-in cookie (dbcl2) was obtained.
     """
     global _session
-    # cloud（无头 VM）：没有浏览器/本地 profile，且 get_douban_cookie 会试图重启真 Chrome，
-    # 在 VM 上毫无意义。直接返回 False → 调用方抛 CookieExpiredError 干净停下，下次续跑。
     try:
         from scraper import fetcher
         if fetcher.is_cloud():
-            logger.info("cloud: 跳过浏览器 cookie 刷新（VM 无浏览器，硬匹配留给本地）")
+            logger.info("cloud: skipping cookie refresh (IP-level block, not a cookie issue)")
             return False
     except Exception:
         pass
     try:
         from .browser_cookie import (
             get_douban_cookie_from_playwright_profile,
-            get_douban_cookie,
             _save_cookie_to_config,
         )
-
-        # 1. Try the saved playwright profile (fast, headless, no browser kill)
         logger.info("403 — trying cookie refresh from playwright_profile ...")
         cookie_str = get_douban_cookie_from_playwright_profile()
-        if not cookie_str or "dbcl2=" not in cookie_str:
-            # 2. Fall back to real Chrome (kills and restarts Chrome)
-            logger.info("playwright_profile has no dbcl2 — trying real Chrome profile ...")
-            cookie_str = get_douban_cookie()
-
         if not cookie_str:
-            logger.warning("Cookie refresh failed — no cookie obtained")
+            logger.info("playwright_profile: no cookies — Playwright fallback will handle login")
             return False
 
         try:
@@ -282,7 +273,7 @@ def _refresh_session_cookie() -> bool:
         has_login = "dbcl2=" in cookie_str
         logger.info("Cookie refreshed (%s, %d chars)",
                     "logged-in" if has_login else "anonymous", len(cookie_str))
-        return has_login  # Only True if we got a real login token
+        return has_login
     except Exception as exc:
         logger.debug("Cookie refresh unavailable: %s", exc)
         return False
@@ -343,11 +334,27 @@ def _fetch_movie_page(subject_id: str, delay: float = 1.5,
     (div#content absent), falls back to the same Playwright browser
     context used for search — handles bot checks and saves fresh cookies.
     """
+    try:
+        from scraper import fetcher as _fetcher
+        _is_cloud = _fetcher.is_cloud()
+    except Exception:
+        _is_cloud = False
+
     url = f"{MOVIE_BASE}/{subject_id}/"
     sess = _get_session()
     prev_referer = sess.headers.get("Referer", "https://movie.douban.com/")
     sess.headers["Referer"] = "https://movie.douban.com/search?cat=1002"
-    resp = _douban_get(url, delay=delay, retries=max_retries)
+    try:
+        resp = _douban_get(url, delay=delay, retries=max_retries)
+    except CookieExpiredError:
+        sess.headers["Referer"] = prev_referer
+        if not _is_cloud:
+            logger.info(
+                "_fetch_movie_page: 403/cookie blocked for id=%s — Playwright fallback",
+                subject_id,
+            )
+            return _fetch_movie_page_playwright(subject_id, delay=delay)
+        raise
     sess.headers["Referer"] = prev_referer
     if resp is None:
         return None
@@ -355,11 +362,6 @@ def _fetch_movie_page(subject_id: str, delay: float = 1.5,
     # Real movie pages always have div#content; absence means bot/sorry page.
     # Playwright fallback is local-only (cloud has no browser, and IP is blocked anyway).
     if soup.select_one("div#content") is None:
-        try:
-            from scraper import fetcher as _fetcher
-            _is_cloud = _fetcher.is_cloud()
-        except Exception:
-            _is_cloud = False
         if not _is_cloud:
             logger.info(
                 "_fetch_movie_page: requests got bot/empty page for id=%s — Playwright fallback",
@@ -588,18 +590,33 @@ def _ensure_pw_context():
             logger.warning("Playwright: .playwright_profile failed: %s — falling back to fresh context", exc)
             ctx = None
 
-    # Option 2: fresh Chrome context + inject config.yaml cookies
-    if ctx is None:
+    # Option 2: fresh system Chrome context + inject config.yaml cookies
+    if ctx is None and browser is None:
         try:
             browser = pw.chromium.launch(
                 headless=False,
                 channel="chrome",
                 args=_ANTI_DETECT_ARGS,
             )
+            logger.info("Playwright: using system Chrome (fresh context)")
+        except Exception as exc:
+            logger.warning("Playwright: channel=chrome failed: %s — trying bundled Chromium", exc)
+
+    # Option 3: bundled Playwright Chromium (independent of system Chrome, always works)
+    if ctx is None and browser is None:
+        try:
+            browser = pw.chromium.launch(
+                headless=False,
+                args=_ANTI_DETECT_ARGS,
+            )
+            logger.info("Playwright: using bundled Chromium (system Chrome unavailable)")
         except Exception as exc:
             pw.stop()
-            logger.warning("Playwright: failed to launch Chrome: %s", exc)
+            logger.warning("Playwright: all launch attempts failed: %s", exc)
             return None
+
+    # Build a context from whichever browser launched (Option 2 or 3)
+    if ctx is None and browser is not None:
         ctx = browser.new_context(
             locale="zh-CN",
             proxy=_pw_proxy,
@@ -661,7 +678,7 @@ def _handle_bot_check(page) -> None:
     After the user solves the verification, extracts fresh cookies and saves
     them back to config.yaml so the requests session also benefits.
     """
-    _BOT_TEXTS = ("证明你是人类", "像机器人程序")
+    _BOT_TEXTS = ("证明你是人类", "像机器人程序", "需要先登录", "登录豆瓣")
 
     def _is_bot_page() -> bool:
         try:
@@ -670,6 +687,8 @@ def _handle_bot_check(page) -> None:
                 return True
             if "misc/sorry" in url:
                 return True
+            if "accounts/login" in url:
+                return True
             return any(t in page.content() for t in _BOT_TEXTS)
         except Exception:
             return False
@@ -677,26 +696,58 @@ def _handle_bot_check(page) -> None:
     if not _is_bot_page():
         return
 
-    # Immediately refresh the requests session token on bot detection
-    logger.info("Bot-check detected — refreshing session token ...")
+    # Bring the Playwright Chrome window to the foreground on Windows.
+    # page.bring_to_front() only activates the tab inside Chrome; it does not
+    # raise the Chrome window itself when another app (e.g. VS Code) holds focus.
+    # SetForegroundWindow + FlashWindowEx do the OS-level window raise.
     try:
-        _refresh_session_cookie()
-    except Exception as exc:
-        logger.debug("Session refresh on bot-check failed: %s", exc)
+        page.bring_to_front()
+    except Exception:
+        pass
+    try:
+        import subprocess as _sp
+        _sp.run(
+            ["powershell", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
+             "$sig = '[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);"
+             "[DllImport(\"user32.dll\")] public static extern bool FlashWindow(IntPtr h, bool b);';"
+             "Add-Type -MemberDefinition $sig -Name WinUI -Namespace Native -ErrorAction SilentlyContinue;"
+             "$procs = Get-Process chrome -ErrorAction SilentlyContinue;"
+             "if (-not $procs) { $procs = Get-Process msedge -ErrorAction SilentlyContinue }"
+             "if ($procs) { $h = ($procs | Sort-Object MainWindowHandle -Descending | Select-Object -First 1).MainWindowHandle;"
+             "if ($h) { [Native.WinUI]::SetForegroundWindow($h); [Native.WinUI]::FlashWindow($h, $true) } }"],
+            capture_output=True, timeout=8,
+        )
+    except Exception:
+        pass
 
-    print(
-        "\n⚠️  豆瓣检测到机器人 — 请在浏览器窗口中完成验证，通过后程序自动继续（最多等 3 分钟）...\n",
-        flush=True,
-    )
-    logger.warning("Douban bot-check detected — waiting for manual verification (3 min timeout)")
+    try:
+        _current_url = page.url
+    except Exception:
+        _current_url = ""
+    if "accounts/login" in _current_url:
+        _prompt = (
+            "\n⚠️  豆瓣要求登录 — Chrome 窗口已弹出，请在浏览器中登录豆瓣账号，\n"
+            "    登录完成后程序自动继续（最多等 3 分钟）...\n"
+            "    （若看不到窗口，请点击任务栏的 Chrome 图标）\n"
+        )
+        _log_msg = "Douban login required — waiting for manual login (3 min timeout)"
+    else:
+        _prompt = (
+            "\n⚠️  豆瓣检测到机器人 — Chrome 窗口已弹出，请完成验证，\n"
+            "    验证通过后程序自动继续（最多等 3 分钟）...\n"
+            "    （若看不到窗口，请点击任务栏的 Chrome 图标）\n"
+        )
+        _log_msg = "Douban bot-check detected — waiting for manual verification (3 min timeout)"
+    print(_prompt, flush=True)
+    logger.warning(_log_msg)
 
     deadline = time.time() + 180
     while time.time() < deadline:
         time.sleep(2)
         if not _is_bot_page():
             _save_pw_cookies_to_config(page)
-            print("✅ 验证通过，继续搜索...\n", flush=True)
-            logger.info("Douban bot-check passed")
+            print("✅ 完成，继续运行...\n", flush=True)
+            logger.info("Douban bot-check/login passed")
             return
 
     raise TimeoutError("Douban bot-check: manual verification timed out (3 min)")
@@ -766,11 +817,12 @@ def _search_web_playwright(q: str, year: int = 0) -> Optional[dict]:
 
 
 def _fetch_movie_page_playwright(subject_id: str, delay: float = 1.5) -> Optional[BeautifulSoup]:
-    """Playwright fallback for fetching a Douban movie detail page.
+    """Fetch a Douban movie detail page via Playwright, simulating human navigation.
 
-    Uses the same browser context as _search_web_playwright, handles bot
-    checks, and saves fresh cookies back to config so the requests session
-    also benefits immediately.
+    Mirrors _search_web_playwright: visits the homepage first to establish a
+    session, then uses the search box to reach the movie page — same flow a
+    human would follow, far less likely to trigger bot detection than jumping
+    directly to the subject URL.
     """
     ctx = _ensure_pw_context()
     if ctx is None:
@@ -783,6 +835,14 @@ def _fetch_movie_page_playwright(subject_id: str, delay: float = 1.5) -> Optiona
         page = ctx.new_page()
         page.bring_to_front()
         try:
+            # Step 1: visit homepage to establish session and set Referer
+            logger.debug("Playwright enrich: loading homepage ...")
+            page.goto("https://movie.douban.com/", wait_until="domcontentloaded", timeout=45000)
+            _handle_bot_check(page)
+            time.sleep(random.uniform(1.0, 2.5))
+
+            # Step 2: navigate to the movie page (like typing URL in address bar)
+            logger.debug("Playwright enrich: navigating to subject page ...")
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
             _handle_bot_check(page)
             time.sleep(random.uniform(delay, delay * 1.5))
