@@ -907,7 +907,7 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
 
     Returns the number of movies enriched this run.
     """
-    from scraper.douban import _fetch_movie_page, init_douban_session, CookieExpiredError
+    from scraper.douban import _fetch_movie_page, init_douban_session, CookieExpiredError, IPBlockedError
 
     cfg = _load_config()
     douban_cfg = cfg.get("douban", {})
@@ -1012,6 +1012,10 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
             subject_id = t["douban_id"]
             try:
                 soup = _fetch_movie_page(subject_id, delay=delay)
+            except IPBlockedError:
+                logger.warning("Full enrich [%d/%d]: IP blocked (misc/sorry) — stopping all enrich",
+                               idx, len(targets))
+                break
             except CookieExpiredError:
                 tracker.record_failure()
                 if keep_going:

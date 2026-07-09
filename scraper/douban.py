@@ -88,6 +88,10 @@ CHECKPOINT_PATH = Path(".douban_checkpoint.json")
 
 class CookieExpiredError(Exception):
     """Raised when Douban returns persistent 403 — cookie likely expired."""
+
+
+class IPBlockedError(Exception):
+    """Raised when Douban shows misc/sorry — IP fully blocked, no point retrying."""
     pass
 
 # ── User-Agent pool (ref: JimSunJing/douban_crawler, Yun-cong/DoubanAPI) ────
@@ -487,13 +491,23 @@ def _load_chrome_profile_from_config() -> str:
 
 def _close_pw_state() -> None:
     global _pw_state
-    for key in ("context", "browser"):
-        try:
-            obj = _pw_state.get(key)
-            if obj:
-                obj.close()
-        except Exception:
-            pass
+    is_cdp = _pw_state.get("cdp", False)
+    # Close the page (tab) we opened — always safe
+    try:
+        page = _pw_state.get("page")
+        if page:
+            page.close()
+    except Exception:
+        pass
+    # For CDP connections don't close context/browser — that would kill the user's Chrome
+    if not is_cdp:
+        for key in ("context", "browser"):
+            try:
+                obj = _pw_state.get(key)
+                if obj:
+                    obj.close()
+            except Exception:
+                pass
     try:
         pw = _pw_state.get("pw")
         if pw:
@@ -512,8 +526,12 @@ def _ensure_pw_context():
     """Return a live Playwright BrowserContext, creating one if needed.
 
     Launch order:
+      0. Connect to user's running Chrome via CDP (port 9222) — uses the real
+         logged-in session without killing Chrome.  Requires Chrome to be started
+         with --remote-debugging-port=9222 (add the flag to the Chrome shortcut).
       1. .playwright_profile/ (created by douban_login.py — has real Douban session)
-      2. Fresh Chrome context + config.yaml cookie injection
+      2. Fresh system Chrome context + config.yaml cookie injection
+      3. Bundled Playwright Chromium (always available as last resort)
     """
     global _pw_state
 
@@ -539,6 +557,7 @@ def _ensure_pw_context():
 
     ctx = None
     browser = None
+    is_cdp = False
 
     # Read proxy from config.yaml (same field used by the requests session)
     proxy_url = ""
@@ -564,31 +583,54 @@ def _ensure_pw_context():
     # Playwright proxy kwarg (used for new_context in the non-persistent path)
     _pw_proxy = {"server": proxy_url} if proxy_url else None
 
+    # Option 0: attach to the user's running Chrome via CDP.
+    # Chrome must be started with --remote-debugging-port=9222 for this to work.
+    # When active, Playwright reuses the user's real profile and Douban login state
+    # without needing to kill Chrome or set up a separate profile.
+    try:
+        import requests as _req
+        r = _req.get("http://127.0.0.1:9222/json/version", timeout=1.5)
+        if r.ok:
+            browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            # Prefer the context that already has open pages (user's real session)
+            existing = [c for c in browser.contexts if c.pages]
+            if existing:
+                ctx = existing[0]
+            elif browser.contexts:
+                ctx = browser.contexts[0]
+            else:
+                ctx = browser.new_context(locale="zh-CN", viewport=random.choice(_VIEWPORTS))
+            is_cdp = True
+            logger.info("Playwright: connected to running Chrome via CDP (port 9222) — using your logged-in profile")
+    except Exception:
+        pass
+
     # Option 1: use .playwright_profile — logged-in Douban session from douban_login.py
-    pw_profile = Path(__file__).resolve().parent.parent / ".playwright_profile"
-    if pw_profile.is_dir():
-        # Remove stale lock files before launching
-        for lock_name in ("LOCK", "SingletonLock", "SingletonCookie", "SingletonSocket"):
-            for search_dir in (pw_profile, pw_profile / "Default"):
-                lf = search_dir / lock_name
-                if lf.exists():
-                    try:
-                        lf.unlink()
-                    except Exception:
-                        pass
-        try:
-            ctx = pw.chromium.launch_persistent_context(
-                str(pw_profile),
-                channel="chrome",
-                headless=False,
-                args=_ANTI_DETECT_ARGS,
-                locale="zh-CN",
-                viewport=random.choice(_VIEWPORTS),
-            )
-            logger.info("Playwright: using .playwright_profile")
-        except Exception as exc:
-            logger.warning("Playwright: .playwright_profile failed: %s — falling back to fresh context", exc)
-            ctx = None
+    if ctx is None:
+        pw_profile = Path(__file__).resolve().parent.parent / ".playwright_profile"
+        if pw_profile.is_dir():
+            # Remove stale lock files before launching
+            for lock_name in ("LOCK", "SingletonLock", "SingletonCookie", "SingletonSocket"):
+                for search_dir in (pw_profile, pw_profile / "Default"):
+                    lf = search_dir / lock_name
+                    if lf.exists():
+                        try:
+                            lf.unlink()
+                        except Exception:
+                            pass
+            try:
+                ctx = pw.chromium.launch_persistent_context(
+                    str(pw_profile),
+                    channel="chrome",
+                    headless=False,
+                    args=_ANTI_DETECT_ARGS,
+                    locale="zh-CN",
+                    viewport=random.choice(_VIEWPORTS),
+                )
+                logger.info("Playwright: using .playwright_profile")
+            except Exception as exc:
+                logger.warning("Playwright: .playwright_profile failed: %s — falling back to fresh context", exc)
+                ctx = None
 
     # Option 2: fresh system Chrome context + inject config.yaml cookies
     if ctx is None and browser is None:
@@ -615,7 +657,7 @@ def _ensure_pw_context():
             logger.warning("Playwright: all launch attempts failed: %s", exc)
             return None
 
-    # Build a context from whichever browser launched (Option 2 or 3)
+    # Build a context from whichever browser launched (Options 2 or 3)
     if ctx is None and browser is not None:
         ctx = browser.new_context(
             locale="zh-CN",
@@ -625,15 +667,17 @@ def _ensure_pw_context():
         )
         logger.info("Playwright: fresh context")
 
-    ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+    # For CDP-connected contexts (user's real Chrome):
+    # - skip stealth init script (already fingerprinted as a real Chrome profile)
+    # - skip cookie injection (user already has login cookies in their profile)
+    if not is_cdp:
+        ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+        if cookie_str:
+            _inject_cookies_into_ctx(ctx, cookie_str)
+            logger.info("Playwright: injected config cookies (dbcl2=%s)",
+                        "yes" if "dbcl2=" in cookie_str else "no")
 
-    # Inject config.yaml cookies into whichever context we got
-    if cookie_str:
-        _inject_cookies_into_ctx(ctx, cookie_str)
-        logger.info("Playwright: injected config cookies (dbcl2=%s)",
-                    "yes" if "dbcl2=" in cookie_str else "no")
-
-    _pw_state.update({"pw": pw, "browser": browser, "context": ctx})
+    _pw_state.update({"pw": pw, "browser": browser, "context": ctx, "cdp": is_cdp})
     atexit.register(close_pw_browser)
     return ctx
 
@@ -678,23 +722,44 @@ def _handle_bot_check(page) -> None:
     After the user solves the verification, extracts fresh cookies and saves
     them back to config.yaml so the requests session also benefits.
     """
-    _BOT_TEXTS = ("证明你是人类", "像机器人程序", "需要先登录", "登录豆瓣")
+    # Only texts unique to bot-verification / full-page-blocked pages.
+    # Do NOT add generic login prompts like "需要先登录" — those appear on
+    # normal movie pages too and cause false positives that block data extraction.
+    _BOT_TEXTS = ("证明你是人类", "像机器人程序")
 
     def _is_bot_page() -> bool:
         try:
+            # sec.douban.com / misc/sorry are unambiguous — check URL first.
             url = page.url
-            if "sec.douban.com" in url:
+            if "sec.douban.com" in url or "misc/sorry" in url:
                 return True
-            if "misc/sorry" in url:
-                return True
-            if "accounts/login" in url:
-                return True
-            return any(t in page.content() for t in _BOT_TEXTS)
+            # For everything else, use page content as the ground truth.
+            # After a JS-based login redirect page.url can be stale (still shows
+            # accounts/login) even though the browser has already moved to the
+            # movie page. Checking id="content" (present on every normal Douban
+            # page, absent on login/bot/sorry pages) avoids that false positive.
+            content = page.content()
+            if 'id="content"' in content:
+                return False
+            # No id="content" — definitely a blocking page. Determine type.
+            return ("accounts/login" in url or
+                    "accounts/login" in content or
+                    any(t in content for t in _BOT_TEXTS))
         except Exception:
             return False
 
     if not _is_bot_page():
         return
+
+    # misc/sorry = IP fully blocked — no human action can fix this, skip immediately.
+    try:
+        if "misc/sorry" in page.url:
+            logger.warning("Playwright: IP blocked (misc/sorry) — aborting all Playwright enrich")
+            raise IPBlockedError("Douban IP blocked (misc/sorry)")
+    except IPBlockedError:
+        raise
+    except Exception:
+        pass
 
     # Bring the Playwright Chrome window to the foreground on Windows.
     # page.bring_to_front() only activates the tab inside Chrome; it does not
@@ -724,30 +789,28 @@ def _handle_bot_check(page) -> None:
         _current_url = page.url
     except Exception:
         _current_url = ""
-    if "accounts/login" in _current_url:
-        _prompt = (
-            "\n⚠️  豆瓣要求登录 — Chrome 窗口已弹出，请在浏览器中登录豆瓣账号，\n"
-            "    登录完成后程序自动继续（最多等 3 分钟）...\n"
-            "    （若看不到窗口，请点击任务栏的 Chrome 图标）\n"
-        )
-        _log_msg = "Douban login required — waiting for manual login (3 min timeout)"
-    else:
-        _prompt = (
-            "\n⚠️  豆瓣检测到机器人 — Chrome 窗口已弹出，请完成验证，\n"
-            "    验证通过后程序自动继续（最多等 3 分钟）...\n"
-            "    （若看不到窗口，请点击任务栏的 Chrome 图标）\n"
-        )
-        _log_msg = "Douban bot-check detected — waiting for manual verification (3 min timeout)"
-    print(_prompt, flush=True)
-    logger.warning(_log_msg)
+    print(
+        f"\n⚠️  Playwright 浏览器被拦截 (当前 URL: {_current_url})\n"
+        "    请在 Playwright 浏览器窗口中完成登录或验证，完成后程序自动继续（最多等 3 分钟）...\n"
+        "    （若看不到正确窗口，请查看任务栏 — 注意是 Playwright 打开的窗口，不是你平时的 Chrome）\n",
+        flush=True,
+    )
+    logger.warning("Playwright blocked, url=%s — waiting for user (3 min timeout)", _current_url)
 
+    # Wait loop: use id="content" as the ground truth.
+    # All valid Douban pages (movie, search, homepage) have id="content".
+    # Bot/login/sorry pages do not. This avoids stale page.url false positives.
     deadline = time.time() + 180
     while time.time() < deadline:
         time.sleep(2)
-        if not _is_bot_page():
+        try:
+            html = page.content()
+        except Exception:
+            continue
+        if 'id="content"' in html:
             _save_pw_cookies_to_config(page)
             print("✅ 完成，继续运行...\n", flush=True)
-            logger.info("Douban bot-check/login passed")
+            logger.info("Playwright: page unblocked (id=content found)")
             return
 
     raise TimeoutError("Douban bot-check: manual verification timed out (3 min)")
@@ -817,13 +880,7 @@ def _search_web_playwright(q: str, year: int = 0) -> Optional[dict]:
 
 
 def _fetch_movie_page_playwright(subject_id: str, delay: float = 1.5) -> Optional[BeautifulSoup]:
-    """Fetch a Douban movie detail page via Playwright, simulating human navigation.
-
-    Mirrors _search_web_playwright: visits the homepage first to establish a
-    session, then uses the search box to reach the movie page — same flow a
-    human would follow, far less likely to trigger bot detection than jumping
-    directly to the subject URL.
-    """
+    """Fetch a Douban movie detail page via Playwright, reusing the same browser tab across calls."""
     ctx = _ensure_pw_context()
     if ctx is None:
         logger.debug("Playwright context unavailable — skipping movie page fallback")
@@ -832,30 +889,47 @@ def _fetch_movie_page_playwright(subject_id: str, delay: float = 1.5) -> Optiona
     url = f"{MOVIE_BASE}/{subject_id}/"
     logger.info("Douban Playwright enrich: %s", url)
     try:
-        page = ctx.new_page()
+        # Reuse the persistent page; create a new one only on first call or if it died.
+        page = _pw_state.get("page")
+        is_new_page = False
+        if page is not None:
+            try:
+                page.url  # raises PlaywrightError if the page has been closed
+            except Exception:
+                page = None
+                _pw_state.pop("page", None)
+        if page is None:
+            page = ctx.new_page()
+            _pw_state["page"] = page
+            is_new_page = True
+
         page.bring_to_front()
-        try:
-            # Step 1: visit homepage to establish session and set Referer
-            logger.debug("Playwright enrich: loading homepage ...")
+
+        if is_new_page:
+            # First call: visit homepage to establish session / warm up Referer.
+            logger.debug("Playwright enrich: new page — loading homepage first ...")
             page.goto("https://movie.douban.com/", wait_until="domcontentloaded", timeout=45000)
             _handle_bot_check(page)
-            time.sleep(random.uniform(1.0, 2.5))
+            time.sleep(random.uniform(1.0, 2.0))
 
-            # Step 2: navigate to the movie page (like typing URL in address bar)
-            logger.debug("Playwright enrich: navigating to subject page ...")
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            _handle_bot_check(page)
-            time.sleep(random.uniform(delay, delay * 1.5))
-            html = page.content()
-        finally:
-            page.close()
+        # Navigate to the movie page (previous page acts as natural Referer).
+        logger.debug("Playwright enrich: navigating to subject page ...")
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        _handle_bot_check(page)
+        time.sleep(random.uniform(delay * 0.5, delay))
+        html = page.content()
+        # Do NOT close the page — keep it open for the next movie.
         return BeautifulSoup(html, "lxml")
+    except IPBlockedError:
+        raise  # propagate so enrich_all_movies can break the loop
     except TimeoutError as exc:
         logger.warning("Playwright: bot-check timed out for id=%s — closing context (%s)", subject_id, exc)
         _close_pw_state()
         return None
     except Exception as exc:
         logger.warning("Playwright: enrich error for id=%s: %s", subject_id, exc)
+        # Page may be in a broken state; drop it so the next call gets a fresh one.
+        _pw_state.pop("page", None)
         return None
 
 

@@ -1,6 +1,6 @@
 """Step 1
 
-操作1: 登記全東京映画館 from /theater/13/ page
+操作1: 登記首都圏映画館 (東京13/埼玉11/千葉12/神奈川14) — 月初のみフルスクレイプ
 操作2: 抓取上映中映画 + 分類 (院線 / 小众 / other)
 """
 from __future__ import annotations
@@ -28,29 +28,16 @@ _HEADERS = {
     "Accept-Language": "ja,en;q=0.8",
 }
 
-# 院線対象エリア (東京23区内) — chain theaters here are 院線
-CHAIN_AREAS = {"池袋", "上野", "渋谷", "新宿", "日本橋", "目黒", "有楽町", "六本木"}
-
-# 院線チェーン名の判定キーワード
+# 院線チェーン名の判定キーワード。chain列が非空 = 院線、空 = 小众（独立系）。
 CHAIN_KEYWORDS = {
     "TOHO": ["TOHOシネマズ"],
     "シネマサンシャイン": ["シネマサンシャイン", "グランドシネマサンシャイン"],
     "テアトルシネマ": ["テアトル"],
 }
 
-# 小众映画対象エリア (indie theaters)
-INDIE_AREAS = {
-    "池袋", "恵比寿", "飯田橋", "大塚", "上野",
-    "銀座",
-    "渋谷", "新宿", "神保町", "水道橋",
-    "高田馬場", "田端",
-    "日本橋",
-    "有楽町",
-    "六本木",
-}
-
-# 全東京映画館ページ
-THEATER_LIST_URL = "https://eiga.com/theater/13/"
+# 首都圏映画館ページ — 東京(13) / 埼玉(11) / 千葉(12) / 神奈川(14)
+THEATER_PREFS = ["13", "11", "12", "14"]
+THEATER_LIST_URLS = {pref: f"https://eiga.com/theater/{pref}/" for pref in THEATER_PREFS}
 
 # 上映中映画ランキング (東京都)
 NOW_SHOWING_URL = "https://eiga.com/now/q/?title=&region=3&pref=13&area=&genre=on&sort=rank"
@@ -82,11 +69,11 @@ def _get_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS theaters (
             theater_id TEXT PRIMARY KEY,   -- eiga.com path e.g. "13/130501/3291"
             name       TEXT NOT NULL,
-            chain      TEXT,              -- "TOHO" / "シネマサンシャイン" / "テアトルシネマ" / NULL
+            chain      TEXT,              -- "TOHO" / "シネマサンシャイン" / "テアトルシネマ" / NULL。非NULL/非空 = 院線判定
             area       TEXT,              -- e.g. "池袋"
             area_code  TEXT,              -- e.g. "130501"
-            category   TEXT,              -- "chain" (院線) / "indie" / "other"
-            url        TEXT
+            url        TEXT,
+            delete_flg INTEGER NOT NULL DEFAULT 0  -- 論理削除: 1=eiga.comから消えた映画館（scanから除外）
         );
         CREATE TABLE IF NOT EXISTS movies (
             movie_id   TEXT PRIMARY KEY,
@@ -104,6 +91,7 @@ def _get_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS screenings (
             movie_id   TEXT NOT NULL,
             theater_id TEXT NOT NULL,
+            last_seen  TEXT,               -- JST date this pair was last confirmed showing
             PRIMARY KEY (movie_id, theater_id),
             FOREIGN KEY (movie_id) REFERENCES movies(movie_id),
             FOREIGN KEY (theater_id) REFERENCES theaters(theater_id)
@@ -132,6 +120,11 @@ def _get_db() -> sqlite3.Connection:
             key TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS theater_scan_log (
+            scan_date  TEXT NOT NULL,   -- JST date, resets scan progress daily
+            theater_id TEXT NOT NULL,
+            PRIMARY KEY (scan_date, theater_id)
+        );
     """)
     # Idempotent ALTER for eiga rating fields (added later).
     # eiga_rating is the 1-5 average shown at the top of each movie page;
@@ -150,6 +143,20 @@ def _get_db() -> sqlite3.Connection:
     # Idempotent ALTER for showtimes.movie_type (added later).
     try:
         conn.execute("ALTER TABLE showtimes ADD COLUMN movie_type TEXT")
+    except Exception:
+        pass
+    # Migration: theaters.category (chain/indie/other) 廃止 → chain列の有無で判定。
+    # 代わりに論理削除フラグ delete_flg を追加。
+    try:
+        conn.execute("ALTER TABLE theaters ADD COLUMN delete_flg INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE theaters DROP COLUMN category")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE screenings ADD COLUMN last_seen TEXT")
     except Exception:
         pass
     conn.commit()
@@ -243,55 +250,51 @@ def _detect_area(name: str) -> str:
 
 
 def _scrape_theater_list_page(delay: float = 0.5) -> list[dict]:
-    """Scrape /theater/13/ page to get ALL Tokyo theaters."""
-    soup = _fetch(THEATER_LIST_URL, delay=delay)
-    if soup is None:
-        return []
-
+    """Scrape /theater/{pref}/ pages for all 首都圏 prefectures (東京/埼玉/千葉/神奈川)."""
     theaters = []
-    # The page has sections by area, each theater is a link /theater/13/AREA_CODE/ID/
-    for a in soup.select("a[href]"):
-        href = a.get("href", "")
-        m = re.search(r"/theater/13/(\d+)/(\d+)/", href)
-        if not m:
+    for pref, url in THEATER_LIST_URLS.items():
+        soup = _fetch(url, delay=delay)
+        if soup is None:
             continue
 
-        area_code = m.group(1)
-        theater_num = m.group(2)
-        theater_id = f"13/{area_code}/{theater_num}"
-        name = a.get_text(strip=True)
+        # The page has sections by area, each theater is a link /theater/PREF/AREA_CODE/ID/
+        for a in soup.select("a[href]"):
+            href = a.get("href", "")
+            m = re.search(rf"/theater/{pref}/(\d+)/(\d+)/", href)
+            if not m:
+                continue
 
-        # Skip if name looks like a count or empty
-        if not name or re.match(r"^\(\d+\)$", name) or len(name) < 2:
-            continue
-        # Remove trailing (N) showing count
-        name = re.sub(r"\s*\(\d+\)\s*$", "", name)
-        # Remove pipe characters that break MD tables
-        name = name.replace("|", "")
+            area_code = m.group(1)
+            theater_num = m.group(2)
+            theater_id = f"{pref}/{area_code}/{theater_num}"
+            name = a.get_text(strip=True)
 
-        if not name:
-            continue
+            # Skip if name looks like a count or empty
+            if not name or re.match(r"^\(\d+\)$", name) or len(name) < 2:
+                continue
+            # Remove trailing (N) showing count
+            name = re.sub(r"\s*\(\d+\)\s*$", "", name)
+            # Remove pipe characters that break MD tables
+            name = name.replace("|", "")
 
-        chain = _detect_chain(name)
-        area = _detect_area(name)
+            if not name:
+                continue
 
-        # Determine category
-        if chain and area in CHAIN_AREAS:
-            category = "chain"
-        elif area in INDIE_AREAS:
-            category = "indie"
-        else:
-            category = "other"
+            chain = _detect_chain(name)
+            # Area-name keyword lookup only covers Tokyo (23-ku) wards, so
+            # theaters in the other 3 prefectures naturally fall through to "" —
+            # that's expected, not a bug (see theaters_export.csv for the manually
+            # curated broad-region names used for those 3 prefectures).
+            area = _detect_area(name)
 
-        theaters.append({
-            "theater_id": theater_id,
-            "name": name,
-            "chain": chain,
-            "area": area,
-            "area_code": area_code,
-            "category": category,
-            "url": f"https://eiga.com/theater/{theater_id}/",
-        })
+            theaters.append({
+                "theater_id": theater_id,
+                "name": name,
+                "chain": chain,
+                "area": area,
+                "area_code": area_code,
+                "url": f"https://eiga.com/theater/{theater_id}/",
+            })
 
     # Deduplicate by theater_id
     seen = set()
@@ -304,10 +307,30 @@ def _scrape_theater_list_page(delay: float = 0.5) -> list[dict]:
     return unique
 
 
-def register_theaters(delay: float = 0.5) -> list[dict]:
-    """操作1: Scrape ALL Tokyo theaters, diff against DB, insert/delete/update."""
+def register_theaters(delay: float = 0.5, force: bool = False) -> list[dict]:
+    """操作1: 映画館マスタ整備（東京/埼玉/千葉/神奈川の4都県）。DBと差分をとってinsert/delete/update。
+
+    フルスクレイプは4都県ぶんの劇場一覧ページを読むため、月初（JST基準で月が
+    変わった最初の実行）だけ行う。それ以外の日は前回スクレイプ結果をDBから
+    そのまま返し、ネットワークアクセスをスキップする。force=True で強制実行可能。
+    """
     conn = _get_db()
 
+    from datetime import datetime, timezone, timedelta
+    JST = timezone(timedelta(hours=9))
+    current_month = datetime.now(JST).strftime("%Y-%m")
+    last_month = _get_run_state("theater_master_last_month")
+    if not force and last_month == current_month:
+        logger.info("Theater master: already maintained this month (%s), skipping scrape.",
+                    current_month)
+        existing_theaters = [
+            dict(row) for row in conn.execute("SELECT * FROM theaters WHERE delete_flg=0").fetchall()
+        ]
+        conn.close()
+        return existing_theaters
+
+    # existing includes logically-deleted rows too, so a theater that reappears
+    # on eiga.com can be revived instead of hitting the PK conflict on INSERT.
     existing = {
         row["theater_id"]: dict(row)
         for row in conn.execute("SELECT * FROM theaters").fetchall()
@@ -317,32 +340,37 @@ def register_theaters(delay: float = 0.5) -> list[dict]:
     scraped_map = {t["theater_id"]: t for t in scraped}
 
     added = [t for tid, t in scraped_map.items() if tid not in existing]
-    removed = [t for tid, t in existing.items() if tid not in scraped_map]
+    revived = [t for tid, t in scraped_map.items() if tid in existing and existing[tid]["delete_flg"]]
+    removed = [t for tid, t in existing.items() if tid not in scraped_map and not t["delete_flg"]]
     updated = [
         t for tid, t in scraped_map.items()
-        if tid in existing and (
+        if tid in existing and not existing[tid]["delete_flg"] and (
             t["name"] != existing[tid]["name"] or
-            t["chain"] != existing[tid]["chain"] or
-            t["category"] != existing[tid]["category"]
+            t["chain"] != existing[tid]["chain"]
         )
     ]
 
     for t in added:
         conn.execute(
-            """INSERT INTO theaters (theater_id, name, chain, area, area_code, category, url)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (t["theater_id"], t["name"], t["chain"],
-             t["area"], t["area_code"], t["category"], t["url"]),
+            """INSERT INTO theaters (theater_id, name, chain, area, area_code, url, delete_flg)
+               VALUES (?, ?, ?, ?, ?, ?, 0)""",
+            (t["theater_id"], t["name"], t["chain"], t["area"], t["area_code"], t["url"]),
+        )
+    for t in revived:
+        conn.execute(
+            """UPDATE theaters SET name=?, chain=?, area=?, area_code=?, url=?, delete_flg=0
+               WHERE theater_id=?""",
+            (t["name"], t["chain"], t["area"], t["area_code"], t["url"], t["theater_id"]),
         )
     for t in removed:
-        conn.execute("DELETE FROM screenings WHERE theater_id=?", (t["theater_id"],))
-        conn.execute("DELETE FROM theaters WHERE theater_id=?", (t["theater_id"],))
+        # 論理削除: 行は残す（screenings/showtimesの履歴を保持）。日次scanは
+        # delete_flg=0 でフィルタするので、以後この映画館は対象外になる。
+        conn.execute("UPDATE theaters SET delete_flg=1 WHERE theater_id=?", (t["theater_id"],))
     for t in updated:
         conn.execute(
-            """UPDATE theaters SET name=?, chain=?, area=?, area_code=?, category=?, url=?
+            """UPDATE theaters SET name=?, chain=?, area=?, area_code=?, url=?
                WHERE theater_id=?""",
-            (t["name"], t["chain"], t["area"], t["area_code"], t["category"], t["url"],
-             t["theater_id"]),
+            (t["name"], t["chain"], t["area"], t["area_code"], t["url"], t["theater_id"]),
         )
 
     conn.commit()
@@ -350,21 +378,25 @@ def register_theaters(delay: float = 0.5) -> list[dict]:
     if added:
         logger.info("Theaters added (%d): %s", len(added),
                     ", ".join(f"[{t['area']}] {t['name']}" for t in added))
+    if revived:
+        logger.info("Theaters revived (%d): %s", len(revived),
+                    ", ".join(f"[{t['area']}] {t['name']}" for t in revived))
     if removed:
-        logger.info("Theaters removed (%d): %s", len(removed),
+        logger.info("Theaters logically deleted (%d): %s", len(removed),
                     ", ".join(f"[{t['area']}] {t['name']}" for t in removed))
     if updated:
         logger.info("Theaters updated (%d): %s", len(updated),
                     ", ".join(f"[{t['area']}] {t['name']}" for t in updated))
-    if not added and not removed and not updated:
+    if not added and not revived and not removed and not updated:
         logger.info("Theaters unchanged (%d total)", len(scraped))
 
-    chain_theaters = [t for t in scraped if t["category"] == "chain"]
-    indie_theaters = [t for t in scraped if t["category"] == "indie"]
+    chain_theaters = [t for t in scraped if t["chain"]]
+    indie_theaters = [t for t in scraped if not t["chain"]]
     logger.info("  院線 (chain): %d  小众 (indie): %d  total: %d",
                 len(chain_theaters), len(indie_theaters), len(scraped))
 
     conn.close()
+    _set_run_state("theater_master_last_month", current_month)
     return scraped
 
 
@@ -565,22 +597,105 @@ def _scrape_eiga_poster(movie_id: str, delay: float = 0.5) -> Optional[str]:
     return _hi_res_poster(src)
 
 
-def _scrape_theater_list(movie_id: str, delay: float = 0.5) -> list[str]:
-    """Fetch '映画館を探す' page for a movie in Tokyo (pref=13), return theater_ids."""
-    url = f"https://eiga.com/movie-pref/{movie_id}/13/"
-    soup = _fetch(url, delay=delay)
-    if soup is None:
-        return []
+def _ensure_movie_detail(conn: sqlite3.Connection, movie_id: str, title_jp: str,
+                         delay: float = 0.5) -> None:
+    """Insert or refresh a movie's metadata row (country/original title/director/
+    cast/rating/poster/etc — NOT category or rank; the caller sets those once all
+    theaters showing it today are known, in a second pass over every theater).
 
-    theater_ids = []
-    for a in soup.select("a[href]"):
-        href = a.get("href", "")
-        m = re.search(r"/movie-theater/\d+/(\d+/\d+/\d+)/", href)
-        if m:
-            tid = m.group(1)
-            if tid not in theater_ids:
-                theater_ids.append(tid)
-    return theater_ids
+    Reuse-if-complete: looks up any existing row by title_jp (not movie_id — the
+    same film may have first appeared under a temp 99999xxx id before eiga.com
+    registered it), and only re-fetches the detail/poster pages if key fields
+    are still missing.
+    """
+    row = conn.execute(
+        "SELECT country, title_original, year, duration, release_date, director, "
+        "eiga_rating, eiga_rating_count, script, cast_names, poster_url FROM movies WHERE title_jp=?",
+        (title_jp,)
+    ).fetchone()
+    existing_eiga_rating = row["eiga_rating"] if row else None
+    existing_eiga_rating_count = row["eiga_rating_count"] if row else None
+    existing_poster = row["poster_url"] if row else None
+
+    # eiga_rating==0 is a real "no rating" value, not a gap — only None counts as missing.
+    reuse = bool(
+        row and row["country"] and existing_eiga_rating is not None
+        and row["director"] and row["cast_names"]
+    )
+    mov: dict = {}
+    if reuse:
+        mov.update({
+            "country": row["country"],
+            "title_original": row["title_original"],
+            "year": row["year"],
+            "duration": row["duration"],
+            "release_date": row["release_date"],
+            "director": row["director"],
+            "eiga_rating": existing_eiga_rating,
+            "eiga_rating_count": existing_eiga_rating_count,
+            "script": row["script"],
+            "cast": row["cast_names"],
+        })
+        logger.info(f"[Step1] Skipped detail for {title_jp} (reuse DB)")
+    else:
+        if row:
+            if not row["country"]:
+                missing = "country"
+            elif existing_eiga_rating is None:
+                missing = "eiga_rating"
+            elif not row["director"]:
+                missing = "director"
+            else:
+                missing = "cast"
+            logger.info(f"[Step1] Re-fetching detail for {title_jp} ({missing} missing)")
+        detail = _scrape_movie_detail(movie_id, delay=delay)
+        mov.update(detail)
+
+    # 海报：DB 已有就复用（不重抓）；否则抓一次海报页 /movie/{id}/photo/。
+    # eiga 没有海报时返回 None → 留空，由 step4 回退到豆瓣海报。
+    mov["poster_url"] = existing_poster or _scrape_eiga_poster(movie_id, delay=delay)
+
+    existing_movie = conn.execute(
+        "SELECT movie_id FROM movies WHERE movie_id=?", (movie_id,)
+    ).fetchone()
+    if not existing_movie:
+        conn.execute(
+            """INSERT INTO movies
+               (movie_id, title_jp, country, title_original, year,
+                duration, release_date, director, eiga_url,
+                eiga_rating, eiga_rating_count, script, cast_names, poster_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (movie_id, title_jp, mov.get("country"), mov.get("title_original"),
+             mov.get("year"), mov.get("duration"), mov.get("release_date"),
+             mov.get("director"), f"https://eiga.com/movie/{movie_id}/",
+             mov.get("eiga_rating"), mov.get("eiga_rating_count"),
+             mov.get("script"), mov.get("cast"), mov.get("poster_url")),
+        )
+    else:
+        # COALESCE preserves existing values when the new fetch returned nothing
+        # for a column (e.g. reused-but-still-missing fields stay as they were).
+        conn.execute(
+            """UPDATE movies SET
+                   country=COALESCE(?, country),
+                   title_original=COALESCE(?, title_original),
+                   year=COALESCE(?, year),
+                   duration=COALESCE(?, duration),
+                   release_date=COALESCE(?, release_date),
+                   director=COALESCE(?, director),
+                   eiga_rating=COALESCE(?, eiga_rating),
+                   eiga_rating_count=COALESCE(?, eiga_rating_count),
+                   script=COALESCE(?, script),
+                   cast_names=COALESCE(?, cast_names),
+                   poster_url=COALESCE(?, poster_url)
+                 WHERE movie_id=?""",
+            (mov.get("country"), mov.get("title_original"),
+             mov.get("year"), mov.get("duration"),
+             mov.get("release_date"), mov.get("director"),
+             mov.get("eiga_rating"), mov.get("eiga_rating_count"),
+             mov.get("script"), mov.get("cast"),
+             mov.get("poster_url"),
+             movie_id),
+        )
 
 
 _TIME_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})")
@@ -703,15 +818,21 @@ def _next_unlisted_id(conn: sqlite3.Connection) -> str:
     return str(base + 1)
 
 
-def _scrape_theater_for_unlisted(theater_id: str, delay: float = 0.5) -> list[dict]:
-    """Scrape a theater's own schedule page for movies not in eiga.com's database.
+_MOVIE_HREF_RE = re.compile(r"(?:https://eiga\.com)?/movie/(\d+)/")
+
+
+def _scrape_theater_schedule(theater_id: str, delay: float = 0.5) -> list[dict]:
+    """Scrape a theater's own schedule page: every movie section showing there
+    today/this week, both eiga.com-registered and unlisted.
 
     On eiga.com's theater page each movie section starts with an h2:
       - <h2 class="title-xlarge ..."><a href="/movie/ID/">title</a></h2>  ← in DB
       - <h2 class="title-xlarge ...">title</h2>                           ← NOT in DB
 
     Walks the page in document order, grouping div.movie-schedule blocks under
-    their preceding h2.  Returns [{title_jp, showtimes}] for unlisted sections only.
+    their preceding h2. Returns [{title_jp, movie_id, showtimes}] for every
+    section — movie_id is the eiga.com id (str) if the h2 links to /movie/ID/,
+    else None (unlisted title; caller resolves/registers a temp id).
     showtimes format is identical to _scrape_showtimes output.
     """
     url = f"https://eiga.com/theater/{theater_id}/"
@@ -737,8 +858,12 @@ def _scrape_theater_for_unlisted(theater_id: str, delay: float = 0.5) -> list[di
 
     results = []
     for h2, scheds in sections:
-        if h2.select_one("a"):
-            continue  # has a link → already in eiga.com's DB
+        a = h2.select_one("a[href*='/movie/']")
+        movie_id = None
+        if a:
+            m = _MOVIE_HREF_RE.match(a.get("href", ""))
+            if m:
+                movie_id = m.group(1)
         title = h2.get_text(strip=True)
         if not title or len(title) < 2:
             continue
@@ -808,27 +933,31 @@ def _scrape_theater_for_unlisted(theater_id: str, delay: float = 0.5) -> list[di
                                 rec["types"].append(t)
                                 seen.add(t["type"])
 
-        results.append({"title_jp": title, "showtimes": [by_slot[k] for k in order]})
+        results.append({"title_jp": title, "movie_id": movie_id,
+                         "showtimes": [by_slot[k] for k in order]})
     return results
 
 
 def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
-    """操作2: Scrape ALL now-showing movies, classify as chain/indie/other.
+    """操作2: 影院为中心扫描 — 逐个非删除影院直接抓其排片页，一次拿到该馆全部电影
+    （已登记 + 未登记）及其今日排片，覆盖首都圏4都県全部活跃影院。
 
     Args:
         delay: per-request delay (seconds).
-        scrape_showtimes: also fetch each movie's per-theater weekly schedule and
-            store it in the `showtimes` table. Adds one request per (movie, theater),
-            so it can be disabled for a fast metadata-only run.
+        scrape_showtimes: also fetch each theater's weekly schedule and store it
+            in the `showtimes` table. Disable for a fast metadata-only run.
 
-    Returns dict with keys: "chain", "indie", "other" — each a list of movie dicts.
+    Returns dict with keys: "chain", "indie", "other" — each a list of movie dicts
+    ("other" is always empty now: every discovered movie is at a known theater,
+    which is either chain or indie by construction — kept for caller compat).
     """
     conn = _get_db()
+    from datetime import datetime, timezone, timedelta
+    JST = timezone(timedelta(hours=9))
 
     # 清理过期排片：删除「处理日前一天」之前的旧场次（JST）。在映电影的场次每轮会
     # 先删后写保持最新，但下线电影（不再被抓取）的旧场次会残留，这里统一清掉。
-    from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
-    _cutoff = (_dt2.now(_tz2(_td2(hours=9))).date() - _td2(days=1)).isoformat()
+    _cutoff = (datetime.now(JST).date() - timedelta(days=1)).isoformat()
     _purged = conn.execute("DELETE FROM showtimes WHERE show_date < ?", (_cutoff,)).rowcount
     conn.commit()
     if _purged:
@@ -838,28 +967,24 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
     # 'chain' field is considered a chain theater. Any theater not in chain_tids is
     # treated as non-chain (indie candidate). This means 'indie' is defined as
     # "not in chain theaters" regardless of geographic area.
+    # delete_flg=0 のみ対象 — 論理削除された映画館はscan対象外。
     chain_tids = {row["theater_id"] for row in
-                  conn.execute("SELECT theater_id FROM theaters WHERE chain IS NOT NULL AND chain<>''").fetchall()}
+                  conn.execute("SELECT theater_id FROM theaters "
+                               "WHERE delete_flg=0 AND chain IS NOT NULL AND chain<>''").fetchall()}
     all_tids = {row["theater_id"] for row in
-                conn.execute("SELECT theater_id FROM theaters").fetchall()}
-    # indie_tids are any known theaters that are not chain theaters
+                conn.execute("SELECT theater_id FROM theaters WHERE delete_flg=0").fetchall()}
     indie_tids = all_tids - chain_tids
 
     logger.info("Theater counts — chain: %d, indie: %d, total: %d",
                 len(chain_tids), len(indie_tids), len(all_tids))
 
-    # Scrape movie listing
     # Check last run date (Tokyo timezone) and skip if already run today
-    from datetime import datetime, timezone, timedelta
     try:
         last = _get_run_state("last_run_date")
         if last:
-            # Stored as ISO date in Japan local date
             last_date = datetime.fromisoformat(last).date()
-            # Current date in JST
-            JST = timezone(timedelta(hours=9))
-            today_jst = datetime.now(JST).date()
-            if last_date == today_jst:
+            today_jst_date = datetime.now(JST).date()
+            if last_date == today_jst_date:
                 logger.info("Step1: already ran today (JST=%s), skipping scrape_movies.", last)
                 # Load today's snapshot from movie_snapshots and assemble results
                 conn2 = _get_db()
@@ -871,7 +996,7 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
                 for s in snaps:
                     mid = s["movie_id"]
                     rank = s["rank"]
-                    cat = s["category"] or "other"
+                    cat = s["category"] or "indie"
                     row = conn2.execute("SELECT * FROM movies WHERE movie_id=?", (mid,)).fetchone()
                     if not row:
                         continue
@@ -883,211 +1008,86 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
                 if total > 0:
                     return out
                 if snaps:
-                    # Snapshots exist but movies table is empty — fall through to re-scrape.
                     logger.warning(
                         "Step1 skip: %d snapshots exist but movies table is empty. "
                         "Re-scraping to repopulate movies table.", len(snaps)
                     )
     except Exception:
-        # If state check fails, proceed normally
         pass
 
     # 新一轮：清零 fetcher 的请求计数/冷却状态
     from scraper import fetcher
     fetcher.reset_state()
 
-    logger.info("Scraping now-showing movies...")
-    movies = _scrape_now_showing(delay=delay)
-    logger.info("Found %d movies in ranking", len(movies))
+    today_jst = datetime.now(JST).date().isoformat()
 
-    # 断点续跑：本轮（今天 JST）已写过快照的电影视为「已抓完」，直接跳过重抓。
-    # 每部抓完会立刻 commit + 写快照（见循环末尾），所以被中途杀掉后重跑只补未完成的。
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _tdj
-    today_jst = _dt.now(_tz(_tdj(hours=9))).date().isoformat()
-    done_today = {
-        r["movie_id"] for r in conn.execute(
-            "SELECT movie_id FROM movie_snapshots WHERE snapshot_date=?", (today_jst,)
+    # 東京榜单：只用来给电影一个可读的排名 rank（显示/排序用），不再用来发现
+    # 影院/排片——那部分现在由下面的逐馆扫描直接拿到，覆盖四都県。
+    logger.info("Scraping Tokyo now-showing ranking (for rank metadata)...")
+    ranked_movies = _scrape_now_showing(delay=delay)
+    rank_by_id = {m["movie_id"]: m["rank"] for m in ranked_movies}
+    logger.info("Found %d ranked movies", len(rank_by_id))
+
+    # 断点续跑：本轮（今天 JST）已扫过的影院直接跳过，改为按「馆」而不是按
+    # 「片」记录进度——一馆一请求就能拿到该馆全部电影+排片，粒度更粗更省请求。
+    done_theaters = {
+        r["theater_id"] for r in conn.execute(
+            "SELECT theater_id FROM theater_scan_log WHERE scan_date=?", (today_jst,)
         ).fetchall()
     }
-    if done_today:
-        logger.info("Step1 续跑：今天已抓完 %d 部，将跳过", len(done_today))
+    if done_theaters:
+        logger.info("Step1 续跑：今天已扫 %d 家影院，将跳过", len(done_theaters))
 
-    results = {"chain": [], "indie": [], "other": []}
-
-
-    for i, mov in enumerate(movies, 1):
-        mid = mov["movie_id"]
-        title_jp = mov["title_jp"]
-
-        # 已在本轮抓完 → 从 DB 取回分类结果，跳过重抓（断点续跑，不重复已完成操作）。
-        if mid in done_today:
-            db_row = conn.execute("SELECT * FROM movies WHERE movie_id=?", (mid,)).fetchone()
-            if db_row:
-                m = dict(db_row)
-                m["rank"] = mov["rank"]
-                cat = m.get("category") or "other"
-                m["_theaters"] = [
-                    r["theater_id"] for r in conn.execute(
-                        "SELECT theater_id FROM screenings WHERE movie_id=?", (mid,)
-                    ).fetchall()
-                ]
-                m["_theater_names"] = [
-                    r["name"] for r in conn.execute(
-                        "SELECT t.name FROM screenings s JOIN theaters t "
-                        "ON t.theater_id=s.theater_id WHERE s.movie_id=?", (mid,)
-                    ).fetchall()
-                ]
-                results.setdefault(cat, []).append(m)
-                logger.info("[%d/%d] %s | %s（已抓，跳过）", i, len(movies), cat, title_jp)
-                continue
-
-        # fetcher 冷却用尽 → 干净停下，已抓数据已落库，下次续跑补完
+    touched_movie_ids: set = set()
+    all_active = sorted(all_tids)
+    for i, tid in enumerate(all_active, 1):
+        if tid in done_theaters:
+            continue
         if fetcher.exhausted():
-            logger.warning("Step1：抓取冷却用尽，本轮提前停止（已抓 %d 部，下次续跑）", i - 1)
+            logger.warning("Step1：抓取冷却用尽，本轮提前停止（已扫 %d/%d 家影院，下次续跑）",
+                           i - 1, len(all_active))
             break
-        # Check if title_jp exists in DB, reuse fields if so. director/script/cast
-        # were added later, so include them to detect (and backfill) old rows.
-        row = conn.execute(
-            "SELECT country, title_original, year, duration, release_date, director, "
-            "eiga_rating, eiga_rating_count, script, cast_names, poster_url FROM movies WHERE title_jp=?",
-            (title_jp,)
+
+        theater_row = conn.execute(
+            "SELECT name FROM theaters WHERE theater_id=?", (tid,)
         ).fetchone()
-        existing_eiga_rating = row["eiga_rating"] if row else None
-        existing_eiga_rating_count = row["eiga_rating_count"] if row else None
-        existing_poster = row["poster_url"] if row else None
+        theater_name = theater_row["name"] if theater_row else tid
 
-        # Re-fetch the detail page if any key field is missing: country, eiga_rating
-        # (NULL only — 0 is a real "no rating" value), director, or cast. This
-        # backfills staff/cast for rows scraped before those columns existed.
-        # eiga_rating==0 means the page had no rating; that's a real value, not a gap.
-        reuse = bool(
-            row and row["country"] and existing_eiga_rating is not None
-            and row["director"] and row["cast_names"]
-        )
-        if reuse:
-            mov.update({
-                "country": row["country"],
-                "title_original": row["title_original"],
-                "year": row["year"],
-                "duration": row["duration"],
-                "release_date": row["release_date"],
-                "director": row["director"],
-                "eiga_rating": existing_eiga_rating,
-                "eiga_rating_count": existing_eiga_rating_count,
-                "script": row["script"],
-                "cast": row["cast_names"],
-            })
-            logger.info(f"[Step1] Skipped detail for {title_jp} (reuse DB)")
-        else:
-            if row:
-                if not row["country"]:
-                    missing = "country"
-                elif existing_eiga_rating is None:
-                    missing = "eiga_rating"
-                elif not row["director"]:
-                    missing = "director"
+        sections = _scrape_theater_schedule(tid, delay=delay)
+        for sec in sections:
+            title_jp = sec["title_jp"]
+            if sec["movie_id"]:
+                mid = sec["movie_id"]
+                if mid not in touched_movie_ids:
+                    touched_movie_ids.add(mid)
+                    _ensure_movie_detail(conn, mid, title_jp, delay=delay)
+            else:
+                # 未登録映画：按 title_jp 找已注册的临时ID，否则新建 99999xxx。
+                existing_m = conn.execute(
+                    "SELECT movie_id FROM movies WHERE title_jp=?", (title_jp,)
+                ).fetchone()
+                if existing_m:
+                    mid = existing_m["movie_id"]
                 else:
-                    missing = "cast"
-                logger.info(f"[Step1] Re-fetching detail for {title_jp} ({missing} missing)")
-            detail = _scrape_movie_detail(mid, delay=delay)
-            mov.update(detail)
+                    mid = _next_unlisted_id(conn)
+                    conn.execute(
+                        "INSERT INTO movies (movie_id, title_jp, eiga_url) VALUES (?,?,NULL)",
+                        (mid, title_jp),
+                    )
+                    logger.info("[unlisted] %s → %s | id=%s", theater_name, title_jp, mid)
+                touched_movie_ids.add(mid)
 
-        # 海报：DB 已有就复用（不重抓）；否则抓一次海报页 /movie/{id}/photo/。
-        # eiga 没有海报时返回 None → 留空，由 step4 回退到豆瓣海报。
-        mov["poster_url"] = existing_poster or _scrape_eiga_poster(mid, delay=delay)
-
-        # Get all theaters showing this movie
-        theater_ids = _scrape_theater_list(mid, delay=delay)
-
-        # Determine category based on whether any of the showing theaters is
-        # classified as chain or indie. "other" theaters (outside Tokyo 23-ku
-        # target areas, e.g. CINEMA NEKO in 東あきる野) must NOT promote a movie
-        # to indie — they should make the movie "other" and excluded from briefing.
-        # Rules:
-        #   - chain: at least one showing theater is a chain theater
-        #   - indie: showing theaters include indie (but no chain) theaters
-        #   - other: only "other" theaters or no Tokyo theaters at all
-        relevant_tids = chain_tids | indie_tids
-        theater_ids_present = [tid for tid in theater_ids if tid in relevant_tids]
-        chain_matches = [tid for tid in theater_ids_present if tid in chain_tids]
-
-        if chain_matches:
-            category = "chain"
-        elif theater_ids_present:
-            category = "indie"
-        else:
-            category = "other"
-
-        # For display and MD, show all known theaters where the movie is playing
-        # (do not restrict by area). For DB screenings we also record all known
-        # theatre matches.
-        mov["_theaters"] = theater_ids_present
-
-        mov["category"] = category
-
-        # Save movie to master movies DB. Core metadata (country, title_original
-        # etc.) is preserved from the first run, but `category` and `rank` must be
-        # refreshed every run — otherwise a movie that started in chain theaters
-        # and later moved to indie/other would forever stay classified as chain.
-        existing = conn.execute("SELECT movie_id FROM movies WHERE movie_id=?", (mid,)).fetchone()
-        if not existing:
+            # upsert screenings with today's date so the post-loop pass can
+            # reconstruct "which theaters show which movie today" even across
+            # a resumed (multi-invocation) run — see done_theaters above.
             conn.execute(
-                """INSERT INTO movies
-                   (movie_id, title_jp, country, title_original, year,
-                    duration, release_date, director, rank, category, eiga_url,
-                    eiga_rating, eiga_rating_count, script, cast_names, poster_url)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (mid, mov["title_jp"], mov.get("country"), mov.get("title_original"),
-                 mov.get("year"), mov.get("duration"), mov.get("release_date"),
-                 mov.get("director"), mov["rank"], category, mov["eiga_url"],
-                 mov.get("eiga_rating"), mov.get("eiga_rating_count"),
-                 mov.get("script"), mov.get("cast"), mov.get("poster_url")),
+                """INSERT INTO screenings (movie_id, theater_id, last_seen) VALUES (?, ?, ?)
+                   ON CONFLICT(movie_id, theater_id) DO UPDATE SET last_seen=excluded.last_seen""",
+                (mid, tid, today_jst),
             )
-        else:
-            # Full UPDATE so re-fetched detail (country / eiga_rating / etc.)
-            # actually lands in DB. COALESCE preserves existing values when the
-            # new fetch returned nothing for a column.
-            conn.execute(
-                """UPDATE movies SET
-                       category=?, rank=?,
-                       country=COALESCE(?, country),
-                       title_original=COALESCE(?, title_original),
-                       year=COALESCE(?, year),
-                       duration=COALESCE(?, duration),
-                       release_date=COALESCE(?, release_date),
-                       director=COALESCE(?, director),
-                       eiga_rating=COALESCE(?, eiga_rating),
-                       eiga_rating_count=COALESCE(?, eiga_rating_count),
-                       script=COALESCE(?, script),
-                       cast_names=COALESCE(?, cast_names),
-                       poster_url=COALESCE(?, poster_url)
-                     WHERE movie_id=?""",
-                (category, mov["rank"],
-                 mov.get("country"), mov.get("title_original"),
-                 mov.get("year"), mov.get("duration"),
-                 mov.get("release_date"), mov.get("director"),
-                 mov.get("eiga_rating"), mov.get("eiga_rating_count"),
-                 mov.get("script"), mov.get("cast"),
-                 mov.get("poster_url"),
-                 mid),
-            )
-
-        # Save screenings for matching theaters (all known showing theaters)
-        relevant_tids = theater_ids_present
-        for tid in relevant_tids:
-            conn.execute(
-                "INSERT OR IGNORE INTO screenings (movie_id, theater_id) VALUES (?, ?)",
-                (mid, tid),
-            )
-
-        # Save real showtimes per theater. Showtimes change daily, so wipe this
-        # movie's previous showtimes and re-store the fresh weekly schedule.
-        if scrape_showtimes:
-            conn.execute("DELETE FROM showtimes WHERE movie_id=?", (mid,))
-            total_slots = 0
-            for tid in relevant_tids:
-                slots = _scrape_showtimes(mid, tid, delay=delay)
-                for s in slots:
+            if scrape_showtimes:
+                conn.execute("DELETE FROM showtimes WHERE movie_id=? AND theater_id=?", (mid, tid))
+                for s in sec["showtimes"]:
                     conn.execute(
                         """INSERT OR REPLACE INTO showtimes
                            (movie_id, theater_id, show_date, start_time, end_time, ticket_url, movie_type)
@@ -1096,104 +1096,69 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
                          s["end_time"], s["ticket_url"],
                          json.dumps(s.get("types") or [], ensure_ascii=False)),
                     )
-                total_slots += len(slots)
-            if total_slots:
-                logger.info("[Step1] %s: %d showtimes across %d theaters",
-                            title_jp, total_slots, len(relevant_tids))
 
-        # Insert a daily snapshot row (snapshot_date, rank, movie_id)
-        # Use JST date to stay consistent with last_run_date which is also stored as JST.
-        from datetime import datetime, timezone, timedelta as _td
-        snapshot_date = datetime.now(timezone(_td(hours=9))).date().isoformat()
+        # 该馆抓完立刻落库 + 记录扫描进度：云端中途被杀也不丢已完成的馆。
+        conn.execute(
+            "INSERT OR REPLACE INTO theater_scan_log (scan_date, theater_id) VALUES (?, ?)",
+            (today_jst, tid),
+        )
+        conn.commit()
+        logger.info("[%d/%d] %s (%s): %d movie section(s)",
+                    i, len(all_active), theater_name, tid, len(sections))
+
+    # 二遍统一算 category/rank/movie_snapshots：从 screenings 里今天被确认过
+    # (last_seen=today) 的 (movie, theater) 对重建「今天谁在哪些馆上映」，这样
+    # 不管本轮是一口气跑完还是分多次续跑完成，结果都是完整、一致的。
+    today_pairs = conn.execute(
+        "SELECT movie_id, theater_id FROM screenings WHERE last_seen=?", (today_jst,)
+    ).fetchall()
+    movie_theaters: dict = {}
+    for r in today_pairs:
+        movie_theaters.setdefault(r["movie_id"], set()).add(r["theater_id"])
+
+    next_fallback_rank = (max(rank_by_id.values()) if rank_by_id else 0) + 1
+
+    results = {"chain": [], "indie": [], "other": []}
+    for mid in sorted(movie_theaters.keys()):
+        tids_for_movie = movie_theaters[mid]
+        category = "chain" if (tids_for_movie & chain_tids) else "indie"
+        rank = rank_by_id.get(mid)
+        if rank is None:
+            rank = next_fallback_rank
+            next_fallback_rank += 1
+
+        conn.execute("UPDATE movies SET category=?, rank=? WHERE movie_id=?", (category, rank, mid))
         conn.execute(
             "INSERT OR REPLACE INTO movie_snapshots (snapshot_date, rank, movie_id, category) VALUES (?,?,?,?)",
-            (snapshot_date, mov["rank"], mid, category),
+            (today_jst, rank, mid, category),
         )
-
-        # Get theater names for display
-        theater_names = []
-        for tid in mov["_theaters"]:
-            row = conn.execute("SELECT name FROM theaters WHERE theater_id=?", (tid,)).fetchone()
-            if row:
-                theater_names.append(row["name"])
-        mov["_theater_names"] = theater_names
-
-        icon = {"chain": "🎬", "indie": "🎭", "other": "⏭️"}[category]
-        logger.info(
-            "[%d/%d] #%d %s %s | %s | %s",
-            i, len(movies), mov["rank"], icon, category,
-            mov["title_jp"],
-            mov.get("country") or "?",
-        )
-
-        results[category].append(mov)
-
-        # 每部抓完立刻落库：免费云中途被杀也已保存，重跑跳过本部。
-        conn.commit()
-
-    # 操作3: 各インディー映画館ページから未登録映画（h2 without <a>）を検出・登記。
-    # 99999xxx 仮 ID を採番。eiga.com に正式登録されたら手動で ID を更新できる。
-    theater_cat_map = {
-        row["theater_id"]: row["category"]
-        for row in conn.execute("SELECT theater_id, category FROM theaters").fetchall()
-    }
-    unlisted_total = 0
-    for tid in sorted(indie_tids):
-        if fetcher.exhausted():
-            logger.info("Step1 unlisted scan: fetcher exhausted, stopping")
-            break
-        theater_row = conn.execute(
-            "SELECT name FROM theaters WHERE theater_id=?", (tid,)
-        ).fetchone()
-        theater_name = theater_row["name"] if theater_row else tid
-        unlisted = _scrape_theater_for_unlisted(tid, delay=delay)
-        for u in unlisted:
-            title_jp = u["title_jp"]
-            existing = conn.execute(
-                "SELECT movie_id FROM movies WHERE title_jp=?", (title_jp,)
-            ).fetchone()
-            if existing:
-                mid = existing["movie_id"]
-            else:
-                mid = _next_unlisted_id(conn)
-                conn.execute(
-                    "INSERT INTO movies (movie_id, title_jp, category, eiga_url) VALUES (?,?,?,NULL)",
-                    (mid, title_jp, theater_cat_map.get(tid, "indie")),
-                )
-                unlisted_total += 1
-                logger.info("[unlisted] %s → %s | id=%s", theater_name, title_jp, mid)
-            conn.execute(
-                "INSERT OR IGNORE INTO screenings (movie_id, theater_id) VALUES (?,?)",
-                (mid, tid),
-            )
-            if scrape_showtimes and u["showtimes"]:
-                conn.execute(
-                    "DELETE FROM showtimes WHERE movie_id=? AND theater_id=?", (mid, tid)
-                )
-                for s in u["showtimes"]:
-                    conn.execute(
-                        """INSERT OR REPLACE INTO showtimes
-                           (movie_id, theater_id, show_date, start_time, end_time, ticket_url, movie_type)
-                           VALUES (?,?,?,?,?,?,?)""",
-                        (mid, tid, s["show_date"], s["start_time"],
-                         s["end_time"], s["ticket_url"],
-                         json.dumps(s.get("types") or [], ensure_ascii=False)),
-                    )
-            conn.commit()
-    if unlisted_total:
-        logger.info("Step1: registered %d new unlisted movies (99999xxx IDs)", unlisted_total)
+        row = conn.execute("SELECT * FROM movies WHERE movie_id=?", (mid,)).fetchone()
+        if not row:
+            continue
+        m = dict(row)
+        m["rank"] = rank
+        m["_theaters"] = sorted(tids_for_movie)
+        ph = ",".join("?" for _ in m["_theaters"])
+        m["_theater_names"] = [
+            r["name"] for r in conn.execute(
+                f"SELECT name FROM theaters WHERE theater_id IN ({ph})", m["_theaters"]
+            ).fetchall()
+        ] if m["_theaters"] else []
+        results[category].append(m)
 
     conn.commit()
     conn.close()
 
-    logger.info("=== Result: chain=%d, indie=%d, other=%d (total=%d) ===",
-                len(results["chain"]), len(results["indie"]),
-                len(results["other"]), len(movies))
-    # Record last successful run date in JST
+    for cat in ("chain", "indie"):
+        results[cat].sort(key=lambda x: x["rank"])
+
+    logger.info("=== Result: chain=%d, indie=%d (total=%d) ===",
+                len(results["chain"]), len(results["indie"]), len(movie_theaters))
+    # Record last successful run date in JST (unconditionally, even if the theater
+    # loop above stopped early on fetcher exhaustion — matches prior behavior:
+    # exhaustion is a deliberate "budget for today is spent" signal, not a crash;
+    # resumability is for actual process kills, via theater_scan_log above).
     try:
-        from datetime import datetime, timezone, timedelta
-        JST = timezone(timedelta(hours=9))
-        today_jst = datetime.now(JST).date().isoformat()
         _set_run_state("last_run_date", today_jst)
     except Exception:
         pass
@@ -1469,8 +1434,8 @@ def generate_step1_md(results: dict, theaters: list[dict]) -> Path:
     outdir = Path("output")
     outdir.mkdir(exist_ok=True)
 
-    chain_theaters = [t for t in theaters if t["category"] == "chain"]
-    indie_theaters = [t for t in theaters if t["category"] == "indie"]
+    chain_theaters = [t for t in theaters if t["chain"]]
+    indie_theaters = [t for t in theaters if not t["chain"]]
     chain_movies = results.get("chain", [])
     indie_movies = results.get("indie", [])
 

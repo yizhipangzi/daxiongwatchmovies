@@ -1,9 +1,9 @@
 """Step 4: 导出小程序 JSON 并上传到微信云开发云存储.
 
-从本地 data/eiga.db 生成 9 个按区拆分的 JSON（结构与小程序现有 data/{district}.js
-一致，并补齐 README §四 预留的新字段：director / cast / doubanWatched /
-doubanWish / doubanComment / showtimes），写到本地 output 目录，再通过云开发
-服务端 HTTP API 上传到云存储。
+从本地 data/eiga.db 生成 12 个按区拆分的 JSON（覆盖首都圏4都県：東京/埼玉/千葉/
+神奈川。结构与小程序现有 data/{district}.js 一致，并补齐 README §四 预留的新字段：
+director / cast / doubanWatched / doubanWish / doubanComment / showtimes），
+写到本地 output 目录，再通过云开发服务端 HTTP API 上传到云存储。
 
 step4 不在 run_scraper.py 内，单独运行（见 run_step4.py）。
 
@@ -23,18 +23,25 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path("data/eiga.db")
 
-# 区 → eiga area_code(s)。区名/中文名沿用小程序现有 data/{district}.js。
-# 顺序与 pages/district/district.js 的 LOADERS 一致。
+# 区 → theaters.area の値そのもの。area は pipeline/step1_eiga.py の登記時点では
+# 空/細かい駅名で入るが、この12区分は運用側で theaters テーブルへ直接まとめて
+# UPDATE した「高度概括」済みの大区分（各回の会話でCSV経由で維持）。ここで
+# area_codeを別途列挙する必要はなく、theaters.area を直接引くだけで済む。
+# id は小程序 data/{id}.js・云存储 {id}.json・pages/index/index.js の SPOTS と
+# 一致させること。
 DISTRICTS = [
-    {"id": "shibuya",      "name": "渋谷",            "nameZh": "涩谷",            "areas": ["130301"]},
-    {"id": "shinjuku",     "name": "新宿",            "nameZh": "新宿",            "areas": ["130201"]},
-    {"id": "takadanobaba", "name": "高田馬場",        "nameZh": "高田马场",        "areas": ["130611"]},
-    {"id": "ikebukuro",    "name": "池袋",            "nameZh": "池袋",            "areas": ["130501"]},
-    {"id": "yurakucho",    "name": "有楽町・銀座・日本橋", "nameZh": "有乐町·银座·日本桥", "areas": ["130102", "130716", "130101"]},
-    {"id": "roppongi",     "name": "六本木",          "nameZh": "六本木",          "areas": ["130401"]},
-    {"id": "ebisu",        "name": "恵比寿・目黒",      "nameZh": "惠比寿·目黑",      "areas": ["130608", "130609"]},
-    {"id": "suidobashi",   "name": "水道橋・飯田橋",     "nameZh": "水道桥·饭田桥",     "areas": ["130710"]},
-    {"id": "ueno",         "name": "上野",            "nameZh": "上野",            "areas": ["130901"]},
+    {"id": "toshin",          "name": "都心",          "nameZh": "都心"},
+    {"id": "shinjuku_shibuya","name": "新宿・渋谷",     "nameZh": "新宿·涩谷"},
+    {"id": "ikebukuro_kita",  "name": "池袋・北",       "nameZh": "池袋·北"},
+    {"id": "suidobashi",      "name": "水道橋・飯田橋",  "nameZh": "水道桥·饭田桥"},
+    {"id": "joto",            "name": "城東",          "nameZh": "城东"},
+    {"id": "jonan",           "name": "城南",          "nameZh": "城南"},
+    {"id": "nishitokyo",      "name": "西東京",         "nameZh": "西东京"},
+    {"id": "saitama",         "name": "埼玉県",         "nameZh": "埼玉县"},
+    {"id": "chiba",           "name": "千葉県",         "nameZh": "千叶县"},
+    {"id": "kawasaki",        "name": "川崎",          "nameZh": "川崎"},
+    {"id": "yokohama",        "name": "横浜",          "nameZh": "横滨"},
+    {"id": "kennishi_shonan", "name": "県西・湘南",      "nameZh": "县西·湘南"},
 ]
 
 
@@ -238,11 +245,11 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
 def build_district(conn: sqlite3.Connection, district: dict,
                    details: dict, matches: dict, showtimes: dict,
                    eiga_reviews: dict) -> dict:
-    placeholders = ",".join("?" for _ in district["areas"])
+    # delete_flg=0: 論理削除された映画館は小程序に出さない。
     theaters_rows = conn.execute(
-        f"SELECT theater_id, name FROM theaters WHERE area_code IN ({placeholders}) "
-        f"ORDER BY name",
-        district["areas"],
+        "SELECT theater_id, name FROM theaters WHERE area = ? AND delete_flg = 0 "
+        "ORDER BY name",
+        (district["name"],),
     ).fetchall()
 
     theaters_out = []

@@ -10,10 +10,11 @@ _setup_logging()  # local=仅控制台；cloud=另写 logs/当天.log，只留 2
 from pipeline.step1_eiga import register_theaters, scrape_movies, generate_step1_md
 
 def main():
-    # 操作1: 映画館登記 (全東京)
+    # 操作1: 映画館登記 (首都圏4都県: 東京/埼玉/千葉/神奈川)。
+    # フルスクレイプは月初(JSTで月が変わった最初の実行)のみ、他の日はDBの既存値を返す。
     theaters = register_theaters(delay=0.3)
-    chain_t = [t for t in theaters if t["category"] == "chain"]
-    indie_t = [t for t in theaters if t["category"] == "indie"]
+    chain_t = [t for t in theaters if t["chain"]]
+    indie_t = [t for t in theaters if not t["chain"]]
     print(f"\n=== Registered {len(theaters)} theaters (chain={len(chain_t)}, indie={len(indie_t)}) ===\n")
     for t in chain_t:
         print(f"  🎬 [{t['area']}] {t['name']} ({t['chain']})")
