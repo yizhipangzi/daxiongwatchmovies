@@ -63,10 +63,10 @@ douban_url 为空 → 删除该电影的 match 记录，下次 step2 会重新�
 - 未登录电影 ID 更新（remap_unlisted_id）
   - 当 Step1 在影院排片页面发现 eiga.com 未收录的电影时，会自动分配 99999xxx 临时 ID 并写入 DB。
   - 一旦该电影被 eiga.com 正式收录（获得真实 movie_id），可用以下方式将临时 ID 替换为正式 ID：
-    ```python
-    from pipeline.step1_eiga import remap_unlisted_id
-    result = remap_unlisted_id("999990001", "93590")
     ```
+    python step2_api.py remap-id 999990001 93590 [--delay N]
+    ```
+    （也可以在 Python 里直接调用 `pipeline.step1_eiga.remap_unlisted_id(old_id, new_id, delay=...)`，效果相同。）
   - 执行效果：
     - 从 eiga.com 抓取 93590 的真实元数据（国家、年份、导演、海报等）补填原记录。
     - 将 screenings / showtimes / douban_matches / douban_details / eiga_reviews 等 8 张子表的 movie_id 级联更新为新 ID。

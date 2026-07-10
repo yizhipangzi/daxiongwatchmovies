@@ -15,6 +15,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -489,6 +490,108 @@ def _load_chrome_profile_from_config() -> str:
     return ""
 
 
+def _chrome_user_data_dir() -> Optional[Path]:
+    """Return the system Chrome "User Data" root dir (contains Default/Profile N/...)."""
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if not local_appdata:
+        return None
+    p = Path(local_appdata) / "Google" / "Chrome" / "User Data"
+    return p if p.is_dir() else None
+
+
+def _resolve_chrome_profile_dir(name: str) -> Optional[str]:
+    """Resolve a configured chrome_profile value to its actual profile directory.
+
+    `name` may already be a real directory name ("Default", "Profile 1") or,
+    more commonly, the display name shown in Chrome's profile switcher (e.g.
+    "pang" for a profile whose directory is actually "Default") — Chrome's
+    ``--profile-directory`` flag only understands the directory name, so we
+    look it up via "Local State"'s profile.info_cache.
+    """
+    user_data = _chrome_user_data_dir()
+    if user_data is None:
+        return None
+    if (user_data / name).is_dir():
+        return name
+    try:
+        state = json.loads((user_data / "Local State").read_text(encoding="utf-8"))
+        for dir_name, info in state.get("profile", {}).get("info_cache", {}).items():
+            if info.get("name") == name:
+                return dir_name
+    except Exception:
+        pass
+    return None
+
+
+def _relaunch_chrome_and_attach_cdp(user_data: Path, profile_dir: str, pw, proxy_url: str):
+    """Kill the running Chrome (which is locking `profile_dir`), relaunch it
+    with a remote-debugging port on that same profile, and attach Playwright
+    over CDP. Chrome is left running afterward — same trade-off as
+    scraper.browser_cookie.get_douban_cookie(): the user's browser windows
+    get closed and reopened, but they can keep using Chrome normally right
+    after, now with a debuggable port Playwright (and future runs) can reuse.
+    """
+    from scraper.browser_cookie import _find_browser, _kill_browser, _free_port, _wait_for_cdp, _remove_locks
+
+    browser_path = _find_browser()
+    if not browser_path:
+        logger.warning("Playwright: no Chrome/Edge executable found for CDP relaunch")
+        return None
+
+    logger.warning("Playwright: chrome_profile in use by a running Chrome — "
+                   "closing it and relaunching with a debug port to take it over")
+    _kill_browser(browser_path)
+    _remove_locks(str(user_data))
+    # Extra settle time: _kill_browser only waits until tasklist stops listing
+    # chrome.exe, but Windows can lag a bit longer releasing the profile's
+    # singleton lock. Relaunching too soon makes the new process silently
+    # hand off to the (file-locked but process-table-gone) old instance,
+    # which then ignores --remote-debugging-port entirely — a window opens
+    # but nothing is actually listening on the port.
+    time.sleep(2)
+
+    port = _free_port()
+    args = [
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data}",
+        f"--profile-directory={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if proxy_url:
+        args.append(f"--proxy-server={proxy_url}")
+
+    # Launched via a detached .bat (not subprocess.Popen directly): on Windows,
+    # Popen's inherited handles stop Chrome from actually opening the debug
+    # port — same issue and same fix as browser_cookie.get_douban_cookie().
+    import subprocess
+    import tempfile
+    arg_str = " ".join(f'"{a}"' if " " in a else a for a in args)
+    bat_path = os.path.join(tempfile.gettempdir(), "_douban_pw_chrome_launch.bat")
+    with open(bat_path, "w") as f:
+        f.write(f'@start "" "{browser_path}" {arg_str}\n')
+    subprocess.run([bat_path], timeout=15, shell=True,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+    if not _wait_for_cdp(port, timeout=45):
+        logger.warning("Playwright: relaunched Chrome's debug port %d never came up", port)
+        return None
+
+    try:
+        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        pages_ctx = [c for c in browser.contexts if c.pages]
+        ctx = pages_ctx[0] if pages_ctx else (
+            browser.contexts[0] if browser.contexts
+            else browser.new_context(locale="zh-CN", viewport=random.choice(_VIEWPORTS))
+        )
+        logger.info("Playwright: attached over CDP to relaunched Chrome (profile=%s, port=%d)",
+                    profile_dir, port)
+        return browser, ctx
+    except Exception as exc:
+        logger.warning("Playwright: CDP attach to relaunched Chrome failed: %s", exc)
+        return None
+
+
 def _close_pw_state() -> None:
     global _pw_state
     is_cdp = _pw_state.get("cdp", False)
@@ -529,9 +632,12 @@ def _ensure_pw_context():
       0. Connect to user's running Chrome via CDP (port 9222) — uses the real
          logged-in session without killing Chrome.  Requires Chrome to be started
          with --remote-debugging-port=9222 (add the flag to the Chrome shortcut).
-      1. .playwright_profile/ (created by douban_login.py — has real Douban session)
-      2. Fresh system Chrome context + config.yaml cookie injection
-      3. Bundled Playwright Chromium (always available as last resort)
+      1. User's real system Chrome profile (config.yaml douban.chrome_profile,
+         e.g. "pang") — has your actual logged-in Douban session. Fails if that
+         profile is already open in a running Chrome (profile dir gets locked).
+      2. .playwright_profile/ (created by douban_login.py — has real Douban session)
+      3. Fresh system Chrome context + config.yaml cookie injection
+      4. Bundled Playwright Chromium (always available as last resort)
     """
     global _pw_state
 
@@ -605,7 +711,43 @@ def _ensure_pw_context():
     except Exception:
         pass
 
-    # Option 1: use .playwright_profile — logged-in Douban session from douban_login.py
+    # Option 1: user's real system Chrome profile (config.yaml douban.chrome_profile,
+    # e.g. "pang") — has your actual logged-in Douban session, no separate login needed.
+    # Fails (raises) if that profile is already open in a running Chrome, since Chrome
+    # won't let two processes share one profile dir; falls through on any failure.
+    if ctx is None:
+        profile_name = _load_chrome_profile_from_config()
+        user_data = _chrome_user_data_dir()
+        if profile_name and user_data is not None:
+            resolved = _resolve_chrome_profile_dir(profile_name)
+            if resolved is None:
+                logger.warning("Playwright: chrome_profile '%s' not found under %s", profile_name, user_data)
+            else:
+                try:
+                    ctx = pw.chromium.launch_persistent_context(
+                        str(user_data),
+                        channel="chrome",
+                        headless=False,
+                        args=_ANTI_DETECT_ARGS + [f"--profile-directory={resolved}"],
+                        locale="zh-CN",
+                        viewport=random.choice(_VIEWPORTS),
+                    )
+                    logger.info("Playwright: using system Chrome profile '%s' (dir=%s)", profile_name, resolved)
+                except Exception as exc:
+                    logger.debug("Playwright: direct launch of profile '%s' failed (%s) — "
+                                "profile is likely locked by a running Chrome, taking it over",
+                                profile_name, exc)
+                    result = _relaunch_chrome_and_attach_cdp(user_data, resolved, pw, proxy_url)
+                    if result is not None:
+                        browser, ctx = result
+                        is_cdp = True
+                    else:
+                        logger.warning(
+                            "Playwright: could not take over system Chrome profile '%s' — falling back",
+                            profile_name)
+                        ctx = None
+
+    # Option 2: use .playwright_profile — logged-in Douban session from douban_login.py
     if ctx is None:
         pw_profile = Path(__file__).resolve().parent.parent / ".playwright_profile"
         if pw_profile.is_dir():
@@ -632,7 +774,7 @@ def _ensure_pw_context():
                 logger.warning("Playwright: .playwright_profile failed: %s — falling back to fresh context", exc)
                 ctx = None
 
-    # Option 2: fresh system Chrome context + inject config.yaml cookies
+    # Option 3: fresh system Chrome context + inject config.yaml cookies
     if ctx is None and browser is None:
         try:
             browser = pw.chromium.launch(
@@ -644,7 +786,7 @@ def _ensure_pw_context():
         except Exception as exc:
             logger.warning("Playwright: channel=chrome failed: %s — trying bundled Chromium", exc)
 
-    # Option 3: bundled Playwright Chromium (independent of system Chrome, always works)
+    # Option 4: bundled Playwright Chromium (independent of system Chrome, always works)
     if ctx is None and browser is None:
         try:
             browser = pw.chromium.launch(
@@ -682,45 +824,15 @@ def _ensure_pw_context():
     return ctx
 
 
-def _save_pw_cookies_to_config(page) -> None:
-    """Extract Douban cookies from Playwright page, save to config.yaml,
-    and reinitialize the requests session so it immediately benefits."""
-    try:
-        all_cookies = page.context.cookies("https://www.douban.com")
-        cookie_str = "; ".join(
-            f"{c['name']}={c['value']}" for c in all_cookies if c.get("name")
-        )
-        if not cookie_str or "dbcl2=" not in cookie_str:
-            return
-        cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
-        if not cfg_path.exists():
-            return
-        text = cfg_path.read_text(encoding="utf-8")
-        new_text = re.sub(r"(cookie:\s*).*", rf"\g<1>'{cookie_str}'", text, count=1)
-        if new_text != text:
-            cfg_path.write_text(new_text, encoding="utf-8")
-            logger.info("Cookies saved to config.yaml (%d chars)", len(cookie_str))
-        # Reinitialize the requests session immediately with the new cookies
-        global _session
-        _session = None
-        try:
-            import yaml as _yaml
-            _cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
-            with _cfg_path.open(encoding="utf-8") as _f:
-                _cfg = _yaml.safe_load(_f) or {}
-            _get_session(_cfg.get("douban", {}))
-            logger.info("Requests session reinitialized with fresh cookies")
-        except Exception as exc:
-            logger.debug("Failed to reinitialize requests session: %s", exc)
-    except Exception as exc:
-        logger.debug("Failed to save cookies: %s", exc)
-
-
 def _handle_bot_check(page) -> None:
-    """Detect Douban bot-check page; pause and wait for the user to pass it.
+    """Detect a Douban bot-check/login-wall page and abort immediately.
 
-    After the user solves the verification, extracts fresh cookies and saves
-    them back to config.yaml so the requests session also benefits.
+    With a real logged-in Chrome profile (config.yaml douban.chrome_profile),
+    hitting this page means the IP is rate-limited/blocked, not "not logged
+    in" — no amount of waiting or manual solving in this run fixes that, it
+    just needs to cool down. So any detection raises IPBlockedError right
+    away so the caller (enrich_all_movies) stops the whole step cleanly
+    instead of retrying movie by movie into the same block.
     """
     # Only texts unique to bot-verification / full-page-blocked pages.
     # Do NOT add generic login prompts like "需要先登录" — those appear on
@@ -751,69 +863,12 @@ def _handle_bot_check(page) -> None:
     if not _is_bot_page():
         return
 
-    # misc/sorry = IP fully blocked — no human action can fix this, skip immediately.
     try:
-        if "misc/sorry" in page.url:
-            logger.warning("Playwright: IP blocked (misc/sorry) — aborting all Playwright enrich")
-            raise IPBlockedError("Douban IP blocked (misc/sorry)")
-    except IPBlockedError:
-        raise
+        current_url = page.url
     except Exception:
-        pass
-
-    # Bring the Playwright Chrome window to the foreground on Windows.
-    # page.bring_to_front() only activates the tab inside Chrome; it does not
-    # raise the Chrome window itself when another app (e.g. VS Code) holds focus.
-    # SetForegroundWindow + FlashWindowEx do the OS-level window raise.
-    try:
-        page.bring_to_front()
-    except Exception:
-        pass
-    try:
-        import subprocess as _sp
-        _sp.run(
-            ["powershell", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
-             "$sig = '[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);"
-             "[DllImport(\"user32.dll\")] public static extern bool FlashWindow(IntPtr h, bool b);';"
-             "Add-Type -MemberDefinition $sig -Name WinUI -Namespace Native -ErrorAction SilentlyContinue;"
-             "$procs = Get-Process chrome -ErrorAction SilentlyContinue;"
-             "if (-not $procs) { $procs = Get-Process msedge -ErrorAction SilentlyContinue }"
-             "if ($procs) { $h = ($procs | Sort-Object MainWindowHandle -Descending | Select-Object -First 1).MainWindowHandle;"
-             "if ($h) { [Native.WinUI]::SetForegroundWindow($h); [Native.WinUI]::FlashWindow($h, $true) } }"],
-            capture_output=True, timeout=8,
-        )
-    except Exception:
-        pass
-
-    try:
-        _current_url = page.url
-    except Exception:
-        _current_url = ""
-    print(
-        f"\n⚠️  Playwright 浏览器被拦截 (当前 URL: {_current_url})\n"
-        "    请在 Playwright 浏览器窗口中完成登录或验证，完成后程序自动继续（最多等 3 分钟）...\n"
-        "    （若看不到正确窗口，请查看任务栏 — 注意是 Playwright 打开的窗口，不是你平时的 Chrome）\n",
-        flush=True,
-    )
-    logger.warning("Playwright blocked, url=%s — waiting for user (3 min timeout)", _current_url)
-
-    # Wait loop: use id="content" as the ground truth.
-    # All valid Douban pages (movie, search, homepage) have id="content".
-    # Bot/login/sorry pages do not. This avoids stale page.url false positives.
-    deadline = time.time() + 180
-    while time.time() < deadline:
-        time.sleep(2)
-        try:
-            html = page.content()
-        except Exception:
-            continue
-        if 'id="content"' in html:
-            _save_pw_cookies_to_config(page)
-            print("✅ 完成，继续运行...\n", flush=True)
-            logger.info("Playwright: page unblocked (id=content found)")
-            return
-
-    raise TimeoutError("Douban bot-check: manual verification timed out (3 min)")
+        current_url = ""
+    logger.warning("Playwright: bot-check/blocked page detected (url=%s) — aborting step", current_url)
+    raise IPBlockedError(f"Douban bot-check/blocked page (url={current_url})")
 
 
 def _search_web_playwright(q: str, year: int = 0) -> Optional[dict]:
@@ -869,9 +924,12 @@ def _search_web_playwright(q: str, year: int = 0) -> Optional[dict]:
         if result is None:
             logger.info("Douban Playwright search: no movie match for %r", q)
         return result
+    except IPBlockedError:
+        raise  # propagate so enrich_all_movies can break the loop
     except TimeoutError as exc:
-        # Bot-check timed out — close Chrome so next call starts fresh
-        logger.warning("Playwright: bot-check timed out for %r — closing context (%s)", q, exc)
+        # Playwright navigation timed out (not a bot-check — that raises
+        # IPBlockedError above) — close Chrome so next call starts fresh.
+        logger.warning("Playwright: navigation timed out for %r — closing context (%s)", q, exc)
         _close_pw_state()
         return None
     except Exception as exc:
@@ -923,7 +981,9 @@ def _fetch_movie_page_playwright(subject_id: str, delay: float = 1.5) -> Optiona
     except IPBlockedError:
         raise  # propagate so enrich_all_movies can break the loop
     except TimeoutError as exc:
-        logger.warning("Playwright: bot-check timed out for id=%s — closing context (%s)", subject_id, exc)
+        # Playwright navigation timed out (not a bot-check — that raises
+        # IPBlockedError above) — close the browser so next call starts fresh.
+        logger.warning("Playwright: navigation timed out for id=%s — closing context (%s)", subject_id, exc)
         _close_pw_state()
         return None
     except Exception as exc:

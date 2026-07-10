@@ -1,7 +1,7 @@
 """Step 1
 
 操作1: 登記首都圏映画館 (東京13/埼玉11/千葉12/神奈川14) — 月初のみフルスクレイプ
-操作2: 抓取上映中映画 + 分類 (院線 / 小众 / other)
+操作2: 影院为中心逐馆抓排片 + 分類 (院線 / 小众)
 """
 from __future__ import annotations
 
@@ -38,9 +38,6 @@ CHAIN_KEYWORDS = {
 # 首都圏映画館ページ — 東京(13) / 埼玉(11) / 千葉(12) / 神奈川(14)
 THEATER_PREFS = ["13", "11", "12", "14"]
 THEATER_LIST_URLS = {pref: f"https://eiga.com/theater/{pref}/" for pref in THEATER_PREFS}
-
-# 上映中映画ランキング (東京都)
-NOW_SHOWING_URL = "https://eiga.com/now/q/?title=&region=3&pref=13&area=&genre=on&sort=rank"
 
 # 映画詳細ページの製作情報regex
 _PROD_RE = re.compile(
@@ -412,52 +409,6 @@ def _get_run_state(key: str) -> Optional[str]:
     row = conn.execute("SELECT value FROM run_state WHERE key=?", (key,)).fetchone()
     conn.close()
     return row[0] if row else None
-
-
-# ── 操作2: 上映中映画抓取 ────────────────────────────────────────────────────
-
-def _scrape_now_showing(delay: float = 0.5) -> list[dict]:
-    """Scrape all pages of now-showing movies (Tokyo, by rank)."""
-    movies = []
-    page = 1
-    rank = 0
-    base = NOW_SHOWING_URL
-
-    while True:
-        url = base if page == 1 else f"{base}&page={page}"
-        soup = _fetch(url, delay=delay)
-        if soup is None:
-            break
-
-        found_any = False
-        for h2 in soup.select("h2"):
-            a = h2.select_one("a[href*='/movie/']")
-            if not a:
-                continue
-            href = a.get("href", "")
-            m = re.match(r"(?:https://eiga\.com)?/movie/(\d+)/", href)
-            if not m:
-                continue
-
-            found_any = True
-            rank += 1
-            movie_id = m.group(1)
-            title = a.get_text(strip=True)
-            # Remove pipe characters that break MD tables
-            title = title.replace("|", "")
-
-            movies.append({
-                "movie_id": movie_id,
-                "title_jp": title,
-                "rank": rank,
-                "eiga_url": f"https://eiga.com/movie/{movie_id}/",
-            })
-
-        if not found_any:
-            break
-        page += 1
-
-    return movies
 
 
 def _staff_names(soup: BeautifulSoup, label: str) -> list[str]:
@@ -1021,13 +972,6 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
 
     today_jst = datetime.now(JST).date().isoformat()
 
-    # 東京榜单：只用来给电影一个可读的排名 rank（显示/排序用），不再用来发现
-    # 影院/排片——那部分现在由下面的逐馆扫描直接拿到，覆盖四都県。
-    logger.info("Scraping Tokyo now-showing ranking (for rank metadata)...")
-    ranked_movies = _scrape_now_showing(delay=delay)
-    rank_by_id = {m["movie_id"]: m["rank"] for m in ranked_movies}
-    logger.info("Found %d ranked movies", len(rank_by_id))
-
     # 断点续跑：本轮（今天 JST）已扫过的影院直接跳过，改为按「馆」而不是按
     # 「片」记录进度——一馆一请求就能拿到该馆全部电影+排片，粒度更粗更省请求。
     done_theaters = {
@@ -1116,16 +1060,16 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
     for r in today_pairs:
         movie_theaters.setdefault(r["movie_id"], set()).add(r["theater_id"])
 
-    next_fallback_rank = (max(rank_by_id.values()) if rank_by_id else 0) + 1
+    # rank: 廃止した東京榜単の代わりに、上映館数が多い順（同数は movie_id 昇順で
+    # 安定ソート）で付け直す。無料で使える人気の目安であり、movie_snapshots の
+    # PRIMARY KEY (snapshot_date, rank) の一意性も自然に保てる。
+    ranked_ids = sorted(movie_theaters.keys(),
+                        key=lambda mid: (-len(movie_theaters[mid]), mid))
 
     results = {"chain": [], "indie": [], "other": []}
-    for mid in sorted(movie_theaters.keys()):
+    for rank, mid in enumerate(ranked_ids, 1):
         tids_for_movie = movie_theaters[mid]
         category = "chain" if (tids_for_movie & chain_tids) else "indie"
-        rank = rank_by_id.get(mid)
-        if rank is None:
-            rank = next_fallback_rank
-            next_fallback_rank += 1
 
         conn.execute("UPDATE movies SET category=?, rank=? WHERE movie_id=?", (category, rank, mid))
         conn.execute(
@@ -1422,6 +1366,111 @@ def remap_unlisted_id(old_id: str, new_id: str, delay: float = 0.5) -> dict:
         "title_jp": old["title_jp"],
         "eiga_url": f"https://eiga.com/movie/{new_id}/",
         "detail_fetched": bool(detail),
+    }
+
+
+def merge_movie_ids(old_id: str, new_id: str) -> dict:
+    """Merge a 99999xxx temp movie into an *already-existing* real movie row.
+
+    Unlike remap_unlisted_id (which promotes a temp ID once eiga.com registers
+    it — new_id must NOT exist yet), this handles the case where the same film
+    was independently discovered twice: once as an unlisted temp ID and once
+    with its real eiga_id (e.g. a different theater listed it with a link).
+    Both rows may already carry their own screenings/showtimes/douban data.
+
+    Conflict rule for every child table keyed (partly) by movie_id: new_id's
+    existing row wins; old_id's row is only adopted where new_id has nothing
+    for that key. movies.* columns follow the same rule via COALESCE — old_id
+    never overwrites a value new_id already has.
+
+    Returns a summary dict. Raises ValueError on bad input.
+    """
+    conn = _get_db()
+
+    old_row = conn.execute("SELECT * FROM movies WHERE movie_id=?", (old_id,)).fetchone()
+    if not old_row:
+        conn.close()
+        raise ValueError(f"movie_id '{old_id}' not found in movies table")
+    if not str(old_id).startswith("99999"):
+        conn.close()
+        raise ValueError(f"'{old_id}' does not look like a 99999xxx temp ID")
+    new_row = conn.execute("SELECT * FROM movies WHERE movie_id=?", (new_id,)).fetchone()
+    if not new_row:
+        conn.close()
+        raise ValueError(
+            f"new_id '{new_id}' does not exist — use remap_unlisted_id instead "
+            f"if eiga.com just registered this movie under a fresh id"
+        )
+
+    old, new = dict(old_row), dict(new_row)
+
+    # movies.*: fill only what new_id is missing, never overwrite.
+    cols = [c for c in old.keys() if c != "movie_id"]
+    set_clause = ", ".join(f"{c}=COALESCE({c}, ?)" for c in cols)
+    conn.execute(
+        f"UPDATE movies SET {set_clause} WHERE movie_id=?",
+        [old[c] for c in cols] + [new_id],
+    )
+
+    # Child tables keyed by (movie_id, ...other pk cols...): move rows that
+    # don't collide with something new_id already has; drop the rest.
+    _CHILD_PKS = {
+        "screenings": ["theater_id"],
+        "showtimes": ["theater_id", "show_date", "start_time"],
+        "eiga_reviews": ["position"],
+        "douban_matches_history": ["snapshot_at"],
+    }
+    moved = {}
+    for table, pk_rest in _CHILD_PKS.items():
+        try:
+            cond = " AND ".join(f"o.{c}=n.{c}" for c in pk_rest)
+            # Table alias on the DELETE target (SQLite 3.39+) so the subquery's
+            # unqualified columns can't shadow-resolve to its own "n" rows —
+            # without it, "col=n.col" inside the subquery binds to n itself
+            # (always true) and wipes out every old_id row, not just conflicts.
+            conn.execute(
+                f"""DELETE FROM {table} AS o WHERE o.movie_id=? AND EXISTS (
+                        SELECT 1 FROM {table} n WHERE n.movie_id=? AND {cond}
+                    )""",
+                (old_id, new_id),
+            )
+            cur = conn.execute(f"UPDATE {table} SET movie_id=? WHERE movie_id=?", (new_id, old_id))
+            moved[table] = cur.rowcount
+        except Exception:
+            pass  # table may not exist in older DBs
+
+    # movie_snapshots: movie_id isn't part of the PK (snapshot_date, rank), so
+    # re-parenting can't collide — just move everything over.
+    try:
+        conn.execute("UPDATE movie_snapshots SET movie_id=? WHERE movie_id=?", (new_id, old_id))
+    except Exception:
+        pass
+
+    # Single-row-per-movie tables (PK = movie_id): keep new_id's row if it has
+    # one, otherwise adopt old_id's.
+    for table in ("douban_matches", "douban_details"):
+        has_new = conn.execute(f"SELECT 1 FROM {table} WHERE movie_id=?", (new_id,)).fetchone()
+        if not has_new:
+            conn.execute(f"UPDATE {table} SET movie_id=? WHERE movie_id=?", (new_id, old_id))
+        else:
+            conn.execute(f"DELETE FROM {table} WHERE movie_id=?", (old_id,))
+
+    # Skip-list status doesn't carry over onto a real, already-registered movie.
+    try:
+        conn.execute("DELETE FROM douban_skip_list WHERE movie_id=?", (old_id,))
+    except Exception:
+        pass
+
+    conn.execute("DELETE FROM movies WHERE movie_id=?", (old_id,))
+    conn.commit()
+    conn.close()
+
+    logger.info("merge_movie_ids: %s → %s (%s)", old_id, new_id, old["title_jp"])
+    return {
+        "old_id": old_id,
+        "new_id": new_id,
+        "title_jp": new.get("title_jp") or old["title_jp"],
+        "moved": moved,
     }
 
 

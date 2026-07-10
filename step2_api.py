@@ -113,6 +113,51 @@ def cmd_manual_set(args):
         sys.exit(1)
 
 
+def cmd_remap_id(args):
+    from pipeline.step1_eiga import remap_unlisted_id, merge_movie_ids, _get_db
+
+    conn = _get_db()
+    new_exists = conn.execute("SELECT 1 FROM movies WHERE movie_id=?", (args.new_id,)).fetchone()
+    conn.close()
+
+    try:
+        if new_exists:
+            # new_id is already a real, separately-discovered movie row (same
+            # film found twice) — merge instead of the plain promote/insert
+            # remap_unlisted_id does, which requires new_id to not exist yet.
+            r = merge_movie_ids(args.old_id, args.new_id)
+            print(f"✅ merged {r['old_id']} → {r['new_id']}  ({r['title_jp']})")
+            if r["moved"]:
+                moved = ", ".join(f"{k}={v}" for k, v in r["moved"].items() if v)
+                if moved:
+                    print(f"   moved: {moved}")
+        else:
+            r = remap_unlisted_id(args.old_id, args.new_id, delay=args.delay)
+            print(f"✅ {r['old_id']} → {r['new_id']}  ({r['title_jp']})")
+            print(f"   eiga_url={r['eiga_url']}  detail_fetched={r['detail_fetched']}")
+    except Exception as exc:
+        print(f"❌ {exc}")
+        sys.exit(1)
+
+
+def cmd_merge_id(args):
+    # Explicit merge-only entry point (same logic remap-id auto-dispatches to
+    # when new_id already exists) — kept for scripts/muscle-memory that want
+    # to name the merge case directly instead of relying on auto-detection.
+    from pipeline.step1_eiga import merge_movie_ids
+
+    try:
+        r = merge_movie_ids(args.old_id, args.new_id)
+        print(f"✅ merged {r['old_id']} → {r['new_id']}  ({r['title_jp']})")
+        if r["moved"]:
+            moved = ", ".join(f"{k}={v}" for k, v in r["moved"].items() if v)
+            if moved:
+                print(f"   moved: {moved}")
+    except Exception as exc:
+        print(f"❌ {exc}")
+        sys.exit(1)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Step2 (Douban) runner and utilities")
     sub = parser.add_subparsers(dest="cmd")
@@ -136,6 +181,26 @@ def main(argv=None):
         help="Skip-list reason when douban_id is null (default: no-douban-entry)",
     )
 
+    p_remap = sub.add_parser(
+        "remap-id",
+        help="Replace a 99999xxx temp movie ID with its real eiga.com ID. Auto-detects: "
+             "promotes if new_id is fresh, merges if new_id already exists (same film "
+             "discovered twice) — either way, just point it at the two ids.",
+    )
+    p_remap.add_argument("old_id", help="Existing 99999xxx temp movie_id")
+    p_remap.add_argument("new_id", help="Real eiga.com movie_id")
+    p_remap.add_argument("--delay", type=float, default=0.5,
+                         help="Request delay (default 0.5s, only used on the promote path)")
+
+    p_merge = sub.add_parser(
+        "merge-id",
+        help="Explicit merge-only form of remap-id (new_id must already exist). "
+             "remap-id does the same thing automatically — this is here for scripts "
+             "that want to say 'merge' explicitly.",
+    )
+    p_merge.add_argument("old_id", help="Existing 99999xxx temp movie_id to merge away")
+    p_merge.add_argument("new_id", help="Real eiga.com movie_id that already exists in the DB")
+
     p_skip = sub.add_parser("skip", help="Manage douban skip list")
     skip_sub = p_skip.add_subparsers(dest="op")
 
@@ -156,6 +221,10 @@ def main(argv=None):
         return run_step2(output_md=not args.no_md, delay=args.delay)
     if args.cmd == "manual-set":
         return cmd_manual_set(args)
+    if args.cmd == "remap-id":
+        return cmd_remap_id(args)
+    if args.cmd == "merge-id":
+        return cmd_merge_id(args)
     if args.cmd == "skip":
         if args.op == "add":
             return cmd_skip_add(args)
