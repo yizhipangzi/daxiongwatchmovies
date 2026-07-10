@@ -920,11 +920,11 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
     now = datetime.now().isoformat(timespec="seconds")
     cutoff = (datetime.now() - timedelta(days=refresh_days)).isoformat(timespec="seconds")
 
-    # 范围 = 匹配上豆瓣(verified) 且（在那 9 个区有排片 或 是 briefing 的 top5）。
-    # 9 区 area_code 以 step4 的 DISTRICTS 为单一来源；briefing top5 即使不在 9 区也要
-    # enrich（简报要用）。不再无脑取全部 chain+indie（会多抓只在大塚/神保町/田端的片）。
+    # 范围 = 匹配上豆瓣(verified) 且（在小程序那些区有排片 或 是 briefing 的 top5）。
+    # 区名以 step4 的 DISTRICTS 为单一来源（现在覆盖首都圏4都県全部活跃影院，
+    # 不再是老的东京9区子集）；briefing top5 即使不在这些区也要 enrich（简报要用）。
     from pipeline.step4_export import DISTRICTS as _DISTRICTS
-    district_areas = tuple({a for d in _DISTRICTS for a in d["areas"]})
+    district_names = tuple(d["name"] for d in _DISTRICTS)
     try:
         from generator.briefing import select_briefing_movie_ids
         briefing_ids = tuple(select_briefing_movie_ids(top_n=5))
@@ -932,7 +932,7 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
         briefing_ids = ()
 
     cat_ph = ",".join("?" for _ in categories)
-    area_ph = ",".join("?" for _ in district_areas) or "''"
+    area_ph = ",".join("?" for _ in district_names) or "''"
     brief_ph = ",".join("?" for _ in briefing_ids) or "''"
     # Verified matches in scope, with their last detail-fetch time.
     # NULL updated_at (never enriched) sorts first; then oldest first.
@@ -951,12 +951,12 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
                    m.movie_id IN (
                        SELECT s.movie_id FROM screenings s
                        JOIN theaters t ON t.theater_id = s.theater_id
-                       WHERE t.area_code IN ({area_ph})
+                       WHERE t.area IN ({area_ph}) AND t.delete_flg = 0
                    )
                    OR m.movie_id IN ({brief_ph})
                )
              ORDER BY (d.updated_at IS NOT NULL), d.updated_at, mv.rank""",
-        tuple(categories) + district_areas + briefing_ids,
+        tuple(categories) + district_names + briefing_ids,
     ).fetchall()
 
     def _needs_fetch(r) -> bool:
