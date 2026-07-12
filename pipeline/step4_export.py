@@ -24,24 +24,31 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path("data/eiga.db")
 
 # 区 → theaters.area の値そのもの。area は pipeline/step1_eiga.py の登記時点では
-# 空/細かい駅名で入るが、この12区分は運用側で theaters テーブルへ直接まとめて
+# 空/細かい駅名で入るが、この15区分は運用側で theaters テーブルへ直接まとめて
 # UPDATE した「高度概括」済みの大区分（各回の会話でCSV経由で維持）。ここで
 # area_codeを別途列挙する必要はなく、theaters.area を直接引くだけで済む。
-# id は小程序 data/{id}.js・云存储 {id}.json・pages/index/index.js の SPOTS と
-# 一致させること。
+# id は小程序 pages/index/index.js の AREAS 熱区・pages/district/district.js の
+# LOADERS・云存储 {id}.json と一致させること（1熱区=1区=1JSON、間接参照なし）。
 DISTRICTS = [
-    {"id": "toshin",          "name": "都心",          "nameZh": "都心"},
+    # 埼玉県
+    {"id": "saitama_city",    "name": "さいたま市",     "nameZh": "埼玉市"},
+    {"id": "saitama_west",    "name": "県西",          "nameZh": "埼玉县西"},
+    {"id": "saitama_south",   "name": "県南",          "nameZh": "埼玉县南"},
+    # 東京都
+    {"id": "ikebukuro_north", "name": "池袋・北",       "nameZh": "池袋·北"},
+    {"id": "ueno_joto",       "name": "上野・城東",     "nameZh": "上野·城东"},
+    {"id": "west_tokyo",      "name": "西東京",         "nameZh": "西东京"},
     {"id": "shinjuku_shibuya","name": "新宿・渋谷",     "nameZh": "新宿·涩谷"},
-    {"id": "ikebukuro_kita",  "name": "池袋・北",       "nameZh": "池袋·北"},
-    {"id": "suidobashi",      "name": "水道橋・飯田橋",  "nameZh": "水道桥·饭田桥"},
-    {"id": "joto",            "name": "城東",          "nameZh": "城东"},
-    {"id": "jonan",           "name": "城南",          "nameZh": "城南"},
-    {"id": "nishitokyo",      "name": "西東京",         "nameZh": "西东京"},
-    {"id": "saitama",         "name": "埼玉県",         "nameZh": "埼玉县"},
-    {"id": "chiba",           "name": "千葉県",         "nameZh": "千叶县"},
-    {"id": "kawasaki",        "name": "川崎",          "nameZh": "川崎"},
+    {"id": "city_center",     "name": "都心",          "nameZh": "都心"},
+    {"id": "south_tokyo",     "name": "城南",          "nameZh": "城南"},
+    # 千葉県
+    {"id": "chiba_northwest", "name": "北西部",         "nameZh": "千叶西北部"},
+    {"id": "chiba_bay",       "name": "湾岸",          "nameZh": "千叶湾岸"},
+    {"id": "chiba_south",     "name": "南部",          "nameZh": "千叶南部"},
+    # 神奈川県
     {"id": "yokohama",        "name": "横浜",          "nameZh": "横滨"},
-    {"id": "kennishi_shonan", "name": "県西・湘南",      "nameZh": "县西·湘南"},
+    {"id": "kawasaki",        "name": "川崎",          "nameZh": "川崎"},
+    {"id": "west_shonan",     "name": "県西・湘南",      "nameZh": "县西·湘南"},
 ]
 
 

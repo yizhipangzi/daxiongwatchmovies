@@ -17,9 +17,10 @@ douban:
   #   ""     — 留空，同 auto
   #   '...'  — 手动粘贴 Cookie 字符串（用单引号包裹，因为 Cookie 内含双引号）
   cookie: ''
-  # Playwright 搜索使用的 Chrome profile 名称（Chrome User Data 目录下的子目录名）
-  # 例如 "Default" 等。留空则用不带 profile 的新 context。
-  chrome_profile: ""
+  # Playwright 用的专用自动化 Chrome 目录（不是你日常用的真实 profile）。
+  # 必须是独立目录——Chrome 出于安全考虑不会在真实/默认 profile 上开放远程
+  # 调试端口。首次用法见 README；留空则跳过这条路径，走其它 fallback。
+  chrome_debug_user_data_dir: ""
   # HTTP 代理（可选），格式如 http://127.0.0.1:7890
   proxy: ""
 

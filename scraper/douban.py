@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import re
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -152,9 +153,160 @@ _DOUBAN_HEADERS = {
 }
 
 
+# ── Multi-account token pool ─────────────────────────────────────────────────
+# Optional douban_tokens.yaml (gitignored, see douban_tokens.yaml.example) lists
+# several logged-in Douban accounts' cookie strings. When the active one gets
+# blocked (403/429, or a Playwright bot-check), we mark it blocked with a
+# cooldown timestamp (persisted, so it stays skipped across runs/days too) and
+# rotate to the next available account instead of failing the whole step.
+# With no douban_tokens.yaml present, behavior is unchanged: single cookie
+# from config.yaml's douban.cookie.
+
+_TOKENS_PATH = Path(__file__).resolve().parent.parent / "douban_tokens.yaml"
+_TOKEN_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "douban_token_state.json"
+_DEFAULT_COOLDOWN_HOURS = 24.0
+
+
+def _load_token_pool() -> list[dict]:
+    """Load [{name, cookie, debug_user_data_dir, debug_port}, ...] from
+    douban_tokens.yaml. [] if absent/empty.
+
+    debug_user_data_dir/debug_port are optional per-account fields for the
+    Playwright path: a dedicated, already-logged-in Chrome directory for
+    that specific account (see _connect_or_launch_debug_chrome). Without
+    them, rotation still works for the plain requests session (_douban_get)
+    but Playwright has nothing account-specific to switch to for that entry.
+    """
+    if not _TOKENS_PATH.exists():
+        return []
+    try:
+        import yaml as _yaml
+        data = _yaml.safe_load(_TOKENS_PATH.read_text(encoding="utf-8")) or {}
+        tokens = data.get("tokens") or []
+        out = []
+        for i, t in enumerate(tokens):
+            cookie = (t.get("cookie") or "").strip()
+            if not cookie:
+                continue
+            out.append({
+                "name": t.get("name") or f"token{i}",
+                "cookie": cookie,
+                "debug_user_data_dir": (t.get("chrome_debug_user_data_dir") or "").strip(),
+                "debug_port": int(t.get("chrome_debug_port") or 9222),
+            })
+        return out
+    except Exception as exc:
+        logger.warning("douban_tokens.yaml: failed to load: %s", exc)
+        return []
+
+
+def _load_token_state() -> dict:
+    if not _TOKEN_STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(_TOKEN_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_token_state(state: dict) -> None:
+    try:
+        _TOKEN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _TOKEN_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("douban_token_state.json: failed to save: %s", exc)
+
+
+def _mark_token_blocked(name: str, reason: str = "", cooldown_hours: float = _DEFAULT_COOLDOWN_HOURS) -> None:
+    from datetime import datetime, timedelta, timezone
+    state = _load_token_state()
+    until = (datetime.now(timezone.utc) + timedelta(hours=cooldown_hours)).isoformat()
+    state[name] = {"blocked_until": until, "blocked_reason": reason}
+    _save_token_state(state)
+    logger.warning("Douban token pool: '%s' blocked until %s (%s)", name, until, reason or "?")
+
+
+def _next_available_token(exclude: Optional[set] = None) -> Optional[dict]:
+    """First pool token that's neither in `exclude` (tried already this call)
+    nor still cooling down from a previous block. None if pool is empty/absent
+    or every entry is currently blocked."""
+    from datetime import datetime, timezone
+    pool = _load_token_pool()
+    if not pool:
+        return None
+    state = _load_token_state()
+    now = datetime.now(timezone.utc)
+    exclude = exclude or set()
+    for t in pool:
+        if t["name"] in exclude:
+            continue
+        entry = state.get(t["name"])
+        if entry and entry.get("blocked_until"):
+            try:
+                if datetime.fromisoformat(entry["blocked_until"]) > now:
+                    continue  # still cooling down
+            except Exception:
+                pass
+        return t
+    return None
+
+
+def _set_session_cookie(sess: requests.Session, cookie_str: str) -> None:
+    sess.cookies.clear()
+    for pair in cookie_str.split(";"):
+        pair = pair.strip()
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            sess.cookies.set(k.strip(), v.strip())
+
+
+def sync_session_cookie_to_pool(name: Optional[str] = None) -> bool:
+    """Upsert the current requests session's cookie into douban_tokens.yaml.
+
+    Meant to run once at the very end of a local run_scraper.py pass: only a
+    local machine can refresh a login cookie (real Chrome / pang profile —
+    the cloud VM has no interactive browser), so this is the "prepare" half
+    of the token pool — keep the locally-refreshed account's entry current so
+    the server side always has something live to rotate to if its own pool
+    tokens get blocked. No-ops if there's no session or it isn't logged in.
+
+    `name` defaults to "primary" if not given. Returns True if the pool file
+    was written.
+    """
+    if _session is None:
+        return False
+    cookies = _session.cookies.get_dict()
+    if "dbcl2" not in cookies:
+        return False  # anonymous cookie — nothing worth pooling
+
+    name = name or "primary"
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    try:
+        import yaml as _yaml
+        data = {}
+        if _TOKENS_PATH.exists():
+            data = _yaml.safe_load(_TOKENS_PATH.read_text(encoding="utf-8")) or {}
+        tokens = data.get("tokens") or []
+        for t in tokens:
+            if t.get("name") == name:
+                t["cookie"] = cookie_str
+                break
+        else:
+            tokens.append({"name": name, "cookie": cookie_str})
+        data["tokens"] = tokens
+        _TOKENS_PATH.write_text(_yaml.dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        logger.info("Douban token pool: synced session cookie into '%s' (%s)", name, _TOKENS_PATH)
+        return True
+    except Exception as exc:
+        logger.warning("Douban token pool: failed to sync session cookie into '%s': %s", name, exc)
+        return False
+
+
 # ── Session management ───────────────────────────────────────────────────────
 
 _session: Optional[requests.Session] = None
+_active_token_name: Optional[str] = None  # which pool entry _session's cookie came from ("" = config.yaml single cookie, not pool)
 
 
 def _get_session(config: Optional[dict] = None) -> requests.Session:
@@ -163,8 +315,12 @@ def _get_session(config: Optional[dict] = None) -> requests.Session:
     Parameters from *config* (the ``douban`` section of config.yaml):
       - ``cookie``  – raw cookie string, or ``"auto"`` to read from browser
       - ``proxy``   – HTTP(S) proxy, e.g. ``http://127.0.0.1:7890``
+
+    If douban_tokens.yaml has any account that isn't currently cooling down
+    from a prior block, its cookie is used instead of config.douban.cookie —
+    see the "Multi-account token pool" section above.
     """
-    global _session
+    global _session, _active_token_name
     if _session is not None:
         return _session
 
@@ -177,7 +333,14 @@ def _get_session(config: Optional[dict] = None) -> requests.Session:
     _session.headers.update(_DOUBAN_HEADERS)
     _session.headers["User-Agent"] = random.choice(_USER_AGENTS)
 
-    if config:
+    pool_token = _next_available_token()
+    if pool_token:
+        _set_session_cookie(_session, pool_token["cookie"])
+        _active_token_name = pool_token["name"]
+        logger.info("Douban session: using token pool account '%s' (%d cookie items)",
+                    pool_token["name"], len(_session.cookies))
+    elif config:
+        _active_token_name = None
         cookie_str = config.get("cookie", "")
 
         # "auto" or empty → restart browser with real profile to read cookies
@@ -203,14 +366,11 @@ def _get_session(config: Optional[dict] = None) -> requests.Session:
                 cookie_str = ""
 
         if cookie_str and cookie_str.strip().lower() != "auto":
-            for pair in cookie_str.split(";"):
-                pair = pair.strip()
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    _session.cookies.set(k.strip(), v.strip())
+            _set_session_cookie(_session, cookie_str)
             logger.info("Douban session: loaded cookie (%d items)",
                         len(_session.cookies))
 
+    if config:
         proxy = config.get("proxy", "")
         if proxy:
             _session.proxies.update({"http": proxy, "https": proxy})
@@ -291,12 +451,15 @@ def _douban_get(url: str, params: Optional[dict] = None,
                 delay: float = 1.5, retries: int = 3) -> Optional[requests.Response]:
     """GET via the shared session; exponential back-off on network errors.
 
-    On 403/429: tries a one-shot cookie refresh, then raises CookieExpiredError
-    immediately — no point burning more retries with a blocked session.
+    On 403/429: if a token pool is configured, marks the active account
+    blocked and rotates through every other available account before giving
+    up. Otherwise (or once the pool is exhausted) tries a one-shot cookie
+    refresh from .playwright_profile, then raises CookieExpiredError.
     """
     # 走统一 fetcher（节流/抖动/可选 Oracle VM 中继换 IP）。传 session 以保留 cookie /
     # curl_cffi TLS 指纹；cooldown=False，因为豆瓣各 enrich 函数已有自己的退避 tracker。
     from . import fetcher
+    global _active_token_name
     sess = _get_session()
     wait = delay
     for attempt in range(1, retries + 1):
@@ -307,8 +470,30 @@ def _douban_get(url: str, params: Optional[dict] = None,
             if resp is None:
                 raise requests.RequestException("fetcher returned None")
             if resp.status_code in (403, 429):
-                logger.warning("Douban %d for %s — attempting cookie refresh",
+                logger.warning("Douban %d for %s — attempting recovery",
                                resp.status_code, url)
+
+                # Token pool: mark the current account blocked, rotate through
+                # every other available one before falling back further.
+                tried = set()
+                while _active_token_name:
+                    tried.add(_active_token_name)
+                    _mark_token_blocked(_active_token_name, reason=f"HTTP {resp.status_code}")
+                    nxt = _next_available_token(exclude=tried)
+                    if not nxt:
+                        break
+                    _set_session_cookie(sess, nxt["cookie"])
+                    _active_token_name = nxt["name"]
+                    logger.info("Douban: rotated to token pool account '%s'", nxt["name"])
+                    resp = fetcher.get(url, params=params, session=sess, delay=eff)
+                    if resp is None:
+                        raise requests.RequestException("fetcher returned None")
+                    if resp.status_code not in (403, 429):
+                        resp.raise_for_status()
+                        return resp
+                    logger.warning("Douban %d for %s (account '%s')",
+                                   resp.status_code, url, nxt["name"])
+
                 if _refresh_session_cookie():
                     sess = _get_session()        # updated cookies
                     resp2 = fetcher.get(url, params=params, session=sess, delay=eff)
@@ -317,7 +502,7 @@ def _douban_get(url: str, params: Optional[dict] = None,
                         return resp2
                 raise CookieExpiredError(
                     f"Douban {resp.status_code} — cookie blocked. "
-                    "Re-run douban_login.py to refresh."
+                    "Re-run douban_login.py to refresh, or add more accounts to douban_tokens.yaml."
                 )
             resp.raise_for_status()
             return resp
@@ -448,6 +633,12 @@ def _search_web(q: str, year: int = 0,
 # ── Persistent Playwright browser (kept open for the whole step2 session) ────
 
 _pw_state: dict = {}  # keys: "pw", "browser", "context"
+# Token-pool bookkeeping for the Playwright cookie-injection path. Kept
+# separate from _pw_state (which _close_pw_state() wipes on every context
+# recreation) so a rotation sequence remembers which accounts it already
+# tried across several _ensure_pw_context() calls.
+_pw_active_token_name: Optional[str] = None
+_pw_tried_tokens: set = set()
 
 
 def _load_cookie_from_config() -> str:
@@ -477,84 +668,78 @@ def _inject_cookies_into_ctx(ctx, cookie_str: str) -> None:
         ctx.add_cookies(cookies)
 
 
-def _load_chrome_profile_from_config() -> str:
+def _load_chrome_debug_dir_from_config() -> str:
+    """config.yaml douban.chrome_debug_user_data_dir — a DEDICATED, non-default
+    Chrome user-data-dir for automation (e.g. "C:\\...\\work\\chrome").
+
+    Chrome refuses to open --remote-debugging-port on your real/default
+    profile as a security measure (confirmed empirically: no launch method —
+    direct launch, kill+relaunch, even the user's own Chrome shortcut — gets
+    a debug port to actually listen when pointed at the real profile). A
+    separate directory isn't subject to that restriction, so logging into
+    Douban there once (stays logged in indefinitely) and always launching
+    Chrome against that directory is the approach that actually works.
+    """
     try:
         import yaml as _yaml
         _cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
         if _cfg_path.exists():
             with _cfg_path.open(encoding="utf-8") as _f:
                 _cfg = _yaml.safe_load(_f) or {}
-            return _cfg.get("douban", {}).get("chrome_profile", "") or ""
+            return _cfg.get("douban", {}).get("chrome_debug_user_data_dir", "") or ""
     except Exception:
         pass
     return ""
 
 
-def _chrome_user_data_dir() -> Optional[Path]:
-    """Return the system Chrome "User Data" root dir (contains Default/Profile N/...)."""
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if not local_appdata:
-        return None
-    p = Path(local_appdata) / "Google" / "Chrome" / "User Data"
-    return p if p.is_dir() else None
+def _connect_or_launch_debug_chrome(user_data_dir: str, pw, proxy_url: str, port: int = 9222):
+    """Attach over CDP to a Chrome instance running on `user_data_dir` with
+    remote debugging enabled; if none is running yet, launch one (real
+    system Chrome, not Playwright's bundled Chromium — the user validated
+    ``chrome.exe --user-data-dir=<dir> --remote-debugging-port=9222
+    --remote-allow-origins=*`` manually first). Left running afterward so
+    subsequent calls (this run or a later one) just reattach instantly.
 
-
-def _resolve_chrome_profile_dir(name: str) -> Optional[str]:
-    """Resolve a configured chrome_profile value to its actual profile directory.
-
-    `name` may already be a real directory name ("Default", "Profile 1") or,
-    more commonly, the display name shown in Chrome's profile switcher (e.g.
-    "pang" for a profile whose directory is actually "Default") — Chrome's
-    ``--profile-directory`` flag only understands the directory name, so we
-    look it up via "Local State"'s profile.info_cache.
+    Returns (browser, context) or None.
     """
-    user_data = _chrome_user_data_dir()
-    if user_data is None:
-        return None
-    if (user_data / name).is_dir():
-        return name
-    try:
-        state = json.loads((user_data / "Local State").read_text(encoding="utf-8"))
-        for dir_name, info in state.get("profile", {}).get("info_cache", {}).items():
-            if info.get("name") == name:
-                return dir_name
-    except Exception:
-        pass
-    return None
+    import requests as _req
 
+    def _try_attach():
+        try:
+            r = _req.get(f"http://127.0.0.1:{port}/json/version", timeout=1.5)
+            if not r.ok:
+                return None
+        except Exception:
+            return None
+        try:
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            pages_ctx = [c for c in browser.contexts if c.pages]
+            ctx = pages_ctx[0] if pages_ctx else (
+                browser.contexts[0] if browser.contexts
+                else browser.new_context(locale="zh-CN", viewport=random.choice(_VIEWPORTS))
+            )
+            return browser, ctx
+        except Exception as exc:
+            logger.debug("Playwright: CDP attach on port %d failed: %s", port, exc)
+            return None
 
-def _relaunch_chrome_and_attach_cdp(user_data: Path, profile_dir: str, pw, proxy_url: str):
-    """Kill the running Chrome (which is locking `profile_dir`), relaunch it
-    with a remote-debugging port on that same profile, and attach Playwright
-    over CDP. Chrome is left running afterward — same trade-off as
-    scraper.browser_cookie.get_douban_cookie(): the user's browser windows
-    get closed and reopened, but they can keep using Chrome normally right
-    after, now with a debuggable port Playwright (and future runs) can reuse.
-    """
-    from scraper.browser_cookie import _find_browser, _kill_browser, _free_port, _wait_for_cdp, _remove_locks
+    result = _try_attach()
+    if result is not None:
+        logger.info("Playwright: attached to already-running debug Chrome (port=%d, dir=%s)",
+                    port, user_data_dir)
+        return result
 
+    from scraper.browser_cookie import _find_browser, _wait_for_cdp
     browser_path = _find_browser()
     if not browser_path:
-        logger.warning("Playwright: no Chrome/Edge executable found for CDP relaunch")
+        logger.warning("Playwright: no Chrome/Edge executable found to launch debug profile")
         return None
 
-    logger.warning("Playwright: chrome_profile in use by a running Chrome — "
-                   "closing it and relaunching with a debug port to take it over")
-    _kill_browser(browser_path)
-    _remove_locks(str(user_data))
-    # Extra settle time: _kill_browser only waits until tasklist stops listing
-    # chrome.exe, but Windows can lag a bit longer releasing the profile's
-    # singleton lock. Relaunching too soon makes the new process silently
-    # hand off to the (file-locked but process-table-gone) old instance,
-    # which then ignores --remote-debugging-port entirely — a window opens
-    # but nothing is actually listening on the port.
-    time.sleep(2)
-
-    port = _free_port()
+    Path(user_data_dir).mkdir(parents=True, exist_ok=True)
     args = [
+        f"--user-data-dir={user_data_dir}",
         f"--remote-debugging-port={port}",
-        f"--user-data-dir={user_data}",
-        f"--profile-directory={profile_dir}",
+        "--remote-allow-origins=*",
         "--no-first-run",
         "--no-default-browser-check",
     ]
@@ -562,34 +747,25 @@ def _relaunch_chrome_and_attach_cdp(user_data: Path, profile_dir: str, pw, proxy
         args.append(f"--proxy-server={proxy_url}")
 
     # Launched via a detached .bat (not subprocess.Popen directly): on Windows,
-    # Popen's inherited handles stop Chrome from actually opening the debug
-    # port — same issue and same fix as browser_cookie.get_douban_cookie().
+    # Popen's inherited handles can stop Chrome from actually opening the
+    # debug port — same fix as scraper.browser_cookie.get_douban_cookie().
     import subprocess
-    import tempfile
     arg_str = " ".join(f'"{a}"' if " " in a else a for a in args)
-    bat_path = os.path.join(tempfile.gettempdir(), "_douban_pw_chrome_launch.bat")
+    bat_path = os.path.join(tempfile.gettempdir(), "_douban_pw_debug_chrome_launch.bat")
     with open(bat_path, "w") as f:
         f.write(f'@start "" "{browser_path}" {arg_str}\n')
     subprocess.run([bat_path], timeout=15, shell=True,
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
-    if not _wait_for_cdp(port, timeout=45):
-        logger.warning("Playwright: relaunched Chrome's debug port %d never came up", port)
+    if not _wait_for_cdp(port, timeout=30):
+        logger.warning("Playwright: launched debug Chrome but port %d never came up", port)
         return None
-
-    try:
-        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-        pages_ctx = [c for c in browser.contexts if c.pages]
-        ctx = pages_ctx[0] if pages_ctx else (
-            browser.contexts[0] if browser.contexts
-            else browser.new_context(locale="zh-CN", viewport=random.choice(_VIEWPORTS))
-        )
-        logger.info("Playwright: attached over CDP to relaunched Chrome (profile=%s, port=%d)",
-                    profile_dir, port)
-        return browser, ctx
-    except Exception as exc:
-        logger.warning("Playwright: CDP attach to relaunched Chrome failed: %s", exc)
-        return None
+    time.sleep(1)
+    result = _try_attach()
+    if result is not None:
+        logger.info("Playwright: launched and attached to debug Chrome (port=%d, dir=%s)",
+                    port, user_data_dir)
+    return result
 
 
 def _close_pw_state() -> None:
@@ -629,12 +805,18 @@ def _ensure_pw_context():
     """Return a live Playwright BrowserContext, creating one if needed.
 
     Launch order:
-      0. Connect to user's running Chrome via CDP (port 9222) — uses the real
-         logged-in session without killing Chrome.  Requires Chrome to be started
-         with --remote-debugging-port=9222 (add the flag to the Chrome shortcut).
-      1. User's real system Chrome profile (config.yaml douban.chrome_profile,
-         e.g. "pang") — has your actual logged-in Douban session. Fails if that
-         profile is already open in a running Chrome (profile dir gets locked).
+      1. Dedicated automation Chrome profile — a NON-default user-data-dir,
+         either the active token-pool account's own
+         chrome_debug_user_data_dir (enables real account rotation on the
+         Playwright side, see _rotate_pw_on_block) or, with no pool / no
+         per-account dir, the single config.yaml
+         douban.chrome_debug_user_data_dir fallback. NOT your real/default
+         Chrome profile, so it isn't subject to Chrome's "no remote
+         debugging on the default profile" restriction (confirmed
+         empirically: no launch method gets around that restriction on the
+         real profile — direct launch, kill+relaunch, even the user's own
+         Chrome shortcut all fail). Attaches if already running, otherwise
+         launches it with --remote-debugging-port + --remote-allow-origins=*.
       2. .playwright_profile/ (created by douban_login.py — has real Douban session)
       3. Fresh system Chrome context + config.yaml cookie injection
       4. Bundled Playwright Chromium (always available as last resort)
@@ -653,7 +835,9 @@ def _ensure_pw_context():
     except ImportError:
         return None
 
-    cookie_str = _load_cookie_from_config()
+    pw_token = _next_available_token(exclude=_pw_tried_tokens)
+    cookie_str = pw_token["cookie"] if pw_token else _load_cookie_from_config()
+    pw_token_name = pw_token["name"] if pw_token else None
 
     try:
         pw = sync_playwright().start()
@@ -664,6 +848,7 @@ def _ensure_pw_context():
     ctx = None
     browser = None
     is_cdp = False
+    ctx_token_name = None  # which pool token (if any) this context corresponds to
 
     # Read proxy from config.yaml (same field used by the requests session)
     proxy_url = ""
@@ -689,63 +874,35 @@ def _ensure_pw_context():
     # Playwright proxy kwarg (used for new_context in the non-persistent path)
     _pw_proxy = {"server": proxy_url} if proxy_url else None
 
-    # Option 0: attach to the user's running Chrome via CDP.
-    # Chrome must be started with --remote-debugging-port=9222 for this to work.
-    # When active, Playwright reuses the user's real profile and Douban login state
-    # without needing to kill Chrome or set up a separate profile.
-    try:
-        import requests as _req
-        r = _req.get("http://127.0.0.1:9222/json/version", timeout=1.5)
-        if r.ok:
-            browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-            # Prefer the context that already has open pages (user's real session)
-            existing = [c for c in browser.contexts if c.pages]
-            if existing:
-                ctx = existing[0]
-            elif browser.contexts:
-                ctx = browser.contexts[0]
-            else:
-                ctx = browser.new_context(locale="zh-CN", viewport=random.choice(_VIEWPORTS))
-            is_cdp = True
-            logger.info("Playwright: connected to running Chrome via CDP (port 9222) — using your logged-in profile")
-    except Exception:
-        pass
-
-    # Option 1: user's real system Chrome profile (config.yaml douban.chrome_profile,
-    # e.g. "pang") — has your actual logged-in Douban session, no separate login needed.
-    # Fails (raises) if that profile is already open in a running Chrome, since Chrome
-    # won't let two processes share one profile dir; falls through on any failure.
+    # Option 1: dedicated automation Chrome profile with its own debug port —
+    # NOT your real/default Chrome profile, so it isn't subject to Chrome's
+    # "no remote debugging on the real profile" restriction. Attaches if
+    # already running, otherwise launches it. Logging into Douban there once
+    # keeps it logged in indefinitely, independent of your daily Chrome.
+    #
+    # Prefers the current token-pool account's OWN debug directory (so
+    # rotating accounts on a block also switches which dedicated Chrome
+    # Playwright drives); falls back to the single config.yaml
+    # douban.chrome_debug_user_data_dir when there's no pool, or the active
+    # pool token doesn't have one configured.
     if ctx is None:
-        profile_name = _load_chrome_profile_from_config()
-        user_data = _chrome_user_data_dir()
-        if profile_name and user_data is not None:
-            resolved = _resolve_chrome_profile_dir(profile_name)
-            if resolved is None:
-                logger.warning("Playwright: chrome_profile '%s' not found under %s", profile_name, user_data)
+        if pw_token and pw_token.get("debug_user_data_dir"):
+            debug_dir = pw_token["debug_user_data_dir"]
+            debug_port = pw_token["debug_port"]
+            candidate_token_name = pw_token_name
+        else:
+            debug_dir = _load_chrome_debug_dir_from_config()
+            debug_port = 9222
+            candidate_token_name = None
+        if debug_dir:
+            result = _connect_or_launch_debug_chrome(debug_dir, pw, proxy_url, port=debug_port)
+            if result is not None:
+                browser, ctx = result
+                is_cdp = True
+                ctx_token_name = candidate_token_name
             else:
-                try:
-                    ctx = pw.chromium.launch_persistent_context(
-                        str(user_data),
-                        channel="chrome",
-                        headless=False,
-                        args=_ANTI_DETECT_ARGS + [f"--profile-directory={resolved}"],
-                        locale="zh-CN",
-                        viewport=random.choice(_VIEWPORTS),
-                    )
-                    logger.info("Playwright: using system Chrome profile '%s' (dir=%s)", profile_name, resolved)
-                except Exception as exc:
-                    logger.debug("Playwright: direct launch of profile '%s' failed (%s) — "
-                                "profile is likely locked by a running Chrome, taking it over",
-                                profile_name, exc)
-                    result = _relaunch_chrome_and_attach_cdp(user_data, resolved, pw, proxy_url)
-                    if result is not None:
-                        browser, ctx = result
-                        is_cdp = True
-                    else:
-                        logger.warning(
-                            "Playwright: could not take over system Chrome profile '%s' — falling back",
-                            profile_name)
-                        ctx = None
+                logger.warning("Playwright: could not attach/launch debug Chrome at '%s' — falling back",
+                               debug_dir)
 
     # Option 2: use .playwright_profile — logged-in Douban session from douban_login.py
     if ctx is None:
@@ -820,6 +977,14 @@ def _ensure_pw_context():
                         "yes" if "dbcl2=" in cookie_str else "no")
 
     _pw_state.update({"pw": pw, "browser": browser, "context": ctx, "cdp": is_cdp})
+    global _pw_active_token_name
+    # ctx_token_name is set precisely by Option 1 when it used a pool
+    # account's own debug Chrome; for the cookie-injection paths (Options
+    # 2/3, non-CDP) the pool token (if any) drove `cookie_str` instead, so
+    # fall back to that. Anything else (Option 0's generic catch-all, or no
+    # pool at all) stays untracked — _rotate_pw_on_block won't try to rotate
+    # a session it doesn't recognize as a specific pool account.
+    _pw_active_token_name = ctx_token_name or (pw_token_name if not is_cdp else None)
     atexit.register(close_pw_browser)
     return ctx
 
@@ -876,8 +1041,13 @@ def _search_web_playwright(q: str, year: int = 0) -> Optional[dict]:
 
     Navigates to the movie homepage, types the query into the search box
     (#inp-query) and presses Enter — avoids directly hitting the search URL
-    which is more likely to trigger bot detection.
+    which is more likely to trigger bot detection. On a bot-check, rotates
+    through the token pool the same way _fetch_movie_page_playwright does.
     """
+    return _rotate_pw_on_block(q, lambda: _search_web_playwright_once(q, year))
+
+
+def _search_web_playwright_once(q: str, year: int = 0) -> Optional[dict]:
     ctx = _ensure_pw_context()
     if ctx is None:
         logger.debug("Playwright context unavailable — skipping browser fallback")
@@ -937,8 +1107,43 @@ def _search_web_playwright(q: str, year: int = 0) -> Optional[dict]:
         return None
 
 
+def _rotate_pw_on_block(label: str, fn):
+    """Call `fn()`; on IPBlockedError, if a token-pool account was active for
+    the current Playwright context, mark it blocked and retry with the next
+    available one (closing the context first so _ensure_pw_context() picks a
+    fresh token). Bounded by the pool size. Re-raises once the pool (or the
+    single non-pool session) is exhausted, so the caller can still stop the
+    whole step as before.
+    """
+    global _pw_active_token_name
+    pool_size = len(_load_token_pool())
+    attempts = max(pool_size, 1)
+    for _ in range(attempts):
+        try:
+            return fn()
+        except IPBlockedError:
+            if not _pw_active_token_name:
+                raise  # not using the pool (pang/.playwright_profile/config cookie) — no rotation possible
+            _mark_token_blocked(_pw_active_token_name, reason="playwright bot-check")
+            _pw_tried_tokens.add(_pw_active_token_name)
+            _pw_active_token_name = None
+            _close_pw_state()  # force a fresh context (and thus a fresh token) next call
+            nxt = _next_available_token(exclude=_pw_tried_tokens)
+            if not nxt:
+                raise  # pool exhausted
+            logger.info("Playwright: rotating to token pool account '%s' after block (%s)", nxt["name"], label)
+    raise IPBlockedError(f"Douban token pool exhausted after {attempts} attempt(s) ({label})")
+
+
 def _fetch_movie_page_playwright(subject_id: str, delay: float = 1.5) -> Optional[BeautifulSoup]:
-    """Fetch a Douban movie detail page via Playwright, reusing the same browser tab across calls."""
+    """Fetch a Douban movie detail page via Playwright, reusing the same browser
+    tab across calls. On a bot-check (IPBlockedError), rotates through every
+    other available token-pool account before giving up — see
+    _rotate_pw_on_block for the shared retry loop."""
+    return _rotate_pw_on_block(subject_id, lambda: _fetch_movie_page_playwright_once(subject_id, delay))
+
+
+def _fetch_movie_page_playwright_once(subject_id: str, delay: float = 1.5) -> Optional[BeautifulSoup]:
     ctx = _ensure_pw_context()
     if ctx is None:
         logger.debug("Playwright context unavailable — skipping movie page fallback")
@@ -979,7 +1184,7 @@ def _fetch_movie_page_playwright(subject_id: str, delay: float = 1.5) -> Optiona
         # Do NOT close the page — keep it open for the next movie.
         return BeautifulSoup(html, "lxml")
     except IPBlockedError:
-        raise  # propagate so enrich_all_movies can break the loop
+        raise  # handled by _rotate_pw_on_block
     except TimeoutError as exc:
         # Playwright navigation timed out (not a bot-check — that raises
         # IPBlockedError above) — close the browser so next call starts fresh.

@@ -506,6 +506,19 @@ def main() -> None:
     except Exception as exc:
         logger.error("step4 导出失败（不影响其它产物）: %s", exc)
 
+    # 本地跑完、这轮用的豆瓣 cookie 全程有效 → 顺手把它同步进 douban_tokens.yaml
+    # 的 token 池（新建或更新同名条目）。只能 local 做：云端 VM 无人值守、没有
+    # 交互式浏览器刷新不了 cookie，只能轮换池里已经有的账号——这一步就是给
+    # 池子"准备"内容的地方。显式判断 is_cloud（虽然前面 cloud 分支已经 return
+    # 过一次到不了这里，这里再挡一道，不依赖那个远处的 return 顺序不变）。
+    if not fetcher.is_cloud():
+        try:
+            from scraper.douban import sync_session_cookie_to_pool
+            if sync_session_cookie_to_pool():
+                print("[OK] 豆瓣 cookie 已同步进 douban_tokens.yaml\n")
+        except Exception as exc:
+            logger.debug("同步 cookie 到 token 池失败（不影响其它产物）: %s", exc)
+
 
 if __name__ == "__main__":
     main()

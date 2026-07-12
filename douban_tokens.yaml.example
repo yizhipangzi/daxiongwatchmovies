@@ -1,0 +1,33 @@
+# 豆瓣多账号 token 池（可选）。
+#
+# 不建这个文件时行为不变：只用 config.yaml 里 douban.cookie 那一个账号。
+# 建了这个文件、且至少有一个账号可用时，会优先从这里选账号；某个账号被封
+# （403/429，或 Playwright 遇到验证页）会自动记录冷却时间并轮换到下一个，
+# 冷却期内那个账号在之后的运行（哪怕是第二天）也会被跳过，直到冷却期过。
+# 所有账号都在冷却中，才会真正报错 / 中断当前 step —— 跟只有一个账号时的
+# 行为一致。
+#
+# cookie 获取方式同 config.yaml 的 douban.cookie：登录豆瓣后 F12 → Console
+# → 输入 document.cookie，复制结果粘进来（要含 dbcl2 才算登录态）。
+#
+# chrome_debug_user_data_dir / chrome_debug_port（可选，Playwright 专用）：
+# 给这个账号配一个独立的自动化 Chrome 目录（不是你日常用的真实 profile——
+# Chrome 不允许在默认 profile 上开远程调试端口，必须是独立目录，用法见
+# config.yaml 里 douban.chrome_debug_user_data_dir 的说明）。配了之后，这个
+# 账号被封时 Playwright 也会跟着切换到下一个账号自己的目录，而不只是切
+# cookie。不配就只有 requests 那条路（_douban_get）能轮换到这个账号，
+# Playwright 路径遇到验证页时这个账号不参与轮换。多账号要各自用不同端口
+# （同时跑多个调试 Chrome 时端口不能冲突）。
+#
+# 复制这个文件为 douban_tokens.yaml（已在 .gitignore，不会被提交）并填入
+# 真实账号即可生效。
+
+tokens:
+  - name: account1
+    cookie: 'dbcl2="..."; ck=...; bid=...'
+    chrome_debug_user_data_dir: 'C:\path\to\dedicated\chrome\profile1'
+    chrome_debug_port: 9222
+  - name: account2
+    cookie: 'dbcl2="..."; ck=...; bid=...'
+    chrome_debug_user_data_dir: 'C:\path\to\dedicated\chrome\profile2'
+    chrome_debug_port: 9223
