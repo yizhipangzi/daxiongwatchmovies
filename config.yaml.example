@@ -63,20 +63,30 @@ deepl:
   # 目标语言：ZH（简体）/ ZH-HANS / ZH-HANT（繁体）
   target_lang: "ZH"
 
+# ── OMDb（IMDb 评分） ────────────────────────────────────────
+omdb:
+  # OMDb API key，免费注册：https://www.omdbapi.com/apikey.aspx（每天 1000 次额度）。
+  # 留空则跳过 IMDb 评分刷新（imdb_id 仍会从豆瓣页面顺手抓，不受影响）。
+  api_key: ""
+
 # ── 评分权重（推荐度算法） ───────────────────────────────────
+# 综合推荐度（0-100 分）= 豆瓣 / IMDb / eiga.com 三个评分来源的贝叶斯加权融合，
+# 用于 step3 简报排序、step4 各区院线电影排序。算法见 pipeline/scoring.py。
 ranking:
-  # 豆瓣评分（满分10分）→ 权重
-  douban_score_weight: 0.35
-  # 豆瓣评价人数（对数归一化）→ 权重
-  douban_votes_weight: 0.15
-  # 想看人数 → 权重
-  douban_want_weight: 0.10
-  # 看过人数 → 权重
-  douban_watched_weight: 0.10
-  # 本周放映场次数 → 权重
-  screening_count_weight: 0.20
-  # 是否为本周新上映 → 权重
-  new_release_weight: 0.10
+  # 各来源权重：豆瓣 > IMDb >>> eiga.com（eiga.com 满分只有 5 分且样本量小，
+  # 权重压到很低，仅在豆瓣/IMDb 都没有数据时才实质起作用）。
+  douban_weight: 0.55
+  imdb_weight: 0.35
+  eiga_weight: 0.10
+  # 贝叶斯收缩的"半信区间"：某来源打分人数达到该值时，原始分与先验各占一半
+  # 权重；人数越少，分数越向先验收缩，避免"几个人打了 10 分"冲上榜首。
+  douban_votes_m: 2000
+  imdb_votes_m: 2000
+  eiga_votes_m: 100
+  # 先验均值（已统一换算到 10 分制）：人数不足时，分数向此值收缩。
+  douban_prior: 6.5
+  imdb_prior: 6.5
+  eiga_prior: 6.5
 
 # ── 简报生成配置 ─────────────────────────────────────────────
 generator:

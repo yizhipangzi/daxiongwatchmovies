@@ -19,6 +19,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from pipeline.scoring import compute_recommend_score, load_ranking_weights
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path("data/eiga.db")
@@ -100,7 +102,8 @@ def _load_douban(conn: sqlite3.Connection) -> tuple[dict, dict]:
     if _table_exists(conn, "douban_matches"):
         for r in conn.execute(
             "SELECT movie_id, title_cn, douban_score, douban_votes, "
-            "director, \"cast\" AS cast, genre, verified FROM douban_matches"
+            "director, \"cast\" AS cast, genre, verified, "
+            "imdb_score, imdb_votes FROM douban_matches"
         ):
             matches[r["movie_id"]] = dict(r)
     return details, matches
@@ -173,7 +176,7 @@ def _load_showtimes(conn: sqlite3.Connection) -> dict:
 
 def _movie_obj(m: sqlite3.Row, theater_id: str,
                details: dict, matches: dict, showtimes: dict,
-               eiga_reviews: dict) -> dict:
+               eiga_reviews: dict, weights: dict) -> dict:
     # 安全取列：老库可能没有 cast_names / eiga_rating 等后加的列。
     cols = m.keys()
     def g(key):
@@ -218,13 +221,23 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
     # eiga 没有时回退豆瓣海报（douban_details.poster_url，step2 从 #mainpic 抓）。
     poster = g("poster_url") or (dd.get("poster_url") if dd else None) or ""
 
-    # sortScore：有豆瓣分用豆瓣分，否则用 eiga 评分(0-5)×2 折算到 10 分制。
-    if douban_score and douban_score > 0:
-        sort_score = round(float(douban_score), 1)
-    elif eiga_rating:
-        sort_score = round(float(eiga_rating) * 2, 1)
-    else:
-        sort_score = 0.0
+    # imdb_score/imdb_votes 只存在 douban_matches，与是否豆瓣匹配成功无关，
+    # 所以单独从 matches 取，不受 matched 分支影响。
+    mt_row = matches.get(mid) or {}
+    imdb_score = mt_row.get("imdb_score") or 0.0
+    imdb_votes = mt_row.get("imdb_votes") or 0
+
+    # recommendScore（=sortScore）：综合推荐度（0-100），豆瓣 / IMDb / eiga.com
+    # 三来源贝叶斯加权融合，见 pipeline/scoring.py。小程序排序 + 展示都用它。
+    recommend_score = compute_recommend_score(
+        douban_score=douban_score or 0,
+        douban_votes=douban_votes or 0,
+        imdb_score=imdb_score,
+        imdb_votes=imdb_votes,
+        eiga_rating=eiga_rating or 0,
+        eiga_votes=g("eiga_rating_count") or 0,
+        weights=weights,
+    )
 
     return {
         "id": mid,
@@ -234,6 +247,8 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
         "eigaRatingCount": g("eiga_rating_count"),
         "doubanScore": round(float(douban_score), 1) if douban_score else 0.0,
         "doubanVotes": douban_votes,
+        "imdbScore": round(float(imdb_score), 1) if imdb_score else 0.0,
+        "imdbVotes": imdb_votes,
         "director": director,
         "cast": cast,
         "genre": genre,
@@ -245,13 +260,16 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
         "poster": poster,
         "doubanComments": comments,
         "showtimes": showtimes.get((mid, theater_id), []),
-        "sortScore": sort_score,
+        # recommendScore：给前端展示用的语义名；sortScore：给排序用（同一个值，
+        # 历史字段名，小程序端已用它排序，保留避免破坏兼容）。
+        "recommendScore": recommend_score,
+        "sortScore": recommend_score,
     }
 
 
 def build_district(conn: sqlite3.Connection, district: dict,
                    details: dict, matches: dict, showtimes: dict,
-                   eiga_reviews: dict) -> dict:
+                   eiga_reviews: dict, weights: dict) -> dict:
     # delete_flg=0: 論理削除された映画館は小程序に出さない。
     theaters_rows = conn.execute(
         "SELECT theater_id, name FROM theaters WHERE area = ? AND delete_flg = 0 "
@@ -268,7 +286,7 @@ def build_district(conn: sqlite3.Connection, district: dict,
         ).fetchall()
         if not movie_rows:
             continue  # 该影院当前无上映电影 → 不收录
-        movies = [_movie_obj(m, t["theater_id"], details, matches, showtimes, eiga_reviews)
+        movies = [_movie_obj(m, t["theater_id"], details, matches, showtimes, eiga_reviews, weights)
                   for m in movie_rows]
         # 今天(JST)在该影院没有场次的电影不输出（showtimes 已是当天一维数组）
         movies = [mv for mv in movies if mv["showtimes"]]
@@ -290,8 +308,9 @@ def build_district(conn: sqlite3.Connection, district: dict,
     }
 
 
-def build_all() -> dict:
+def build_all(config: Optional[dict] = None) -> dict:
     """返回 {district_id: district_json_dict}。"""
+    weights = load_ranking_weights(config)
     conn = _get_db()
     try:
         details, matches = _load_douban(conn)
@@ -299,7 +318,7 @@ def build_all() -> dict:
         eiga_reviews = _load_eiga_reviews(conn)
         out = {}
         for d in DISTRICTS:
-            dj = build_district(conn, d, details, matches, showtimes, eiga_reviews)
+            dj = build_district(conn, d, details, matches, showtimes, eiga_reviews, weights)
             out[d["id"]] = dj
             logger.info("Step4 build: %s — %d theaters, %d movies",
                         d["id"], dj["theaterCount"],
@@ -363,7 +382,7 @@ def run(config: dict, out_dir: Path, upload: bool = True) -> dict:
 
     返回 {"files": [...], "file_ids": {...}}。
     """
-    data = build_all()
+    data = build_all(config)
     files = write_local(data, out_dir)
     # 版本清单随同上传，供小程序判断缓存是否需要更新（含 rerun 覆盖）。
     manifest_path = write_manifest(files, out_dir)

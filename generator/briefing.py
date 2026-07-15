@@ -39,6 +39,7 @@ from .briefing_template import (
     NO_THEATERS,
     EMPTY_FIELD,
 )
+from pipeline.scoring import compute_recommend_score, load_ranking_weights
 
 
 def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str],
@@ -197,7 +198,7 @@ _SECTION_SPECS: dict[str, dict] = {
                 m, today, days=180 if _is_japan_only(m) else 720
             )
         ),
-        "sort_key": lambda m: -(m.get("douban_score") or 0),
+        "sort_key": lambda m: -(m.get("recommend_score") or 0),
         "hide_when_empty": False,
     },
     # 院线经典: chain + classic (today_year - douban_year > 3) + score>0.
@@ -208,7 +209,7 @@ _SECTION_SPECS: dict[str, dict] = {
             and (m.get("watched") or 0) > 1000
             and _year_diff(m, today) > 3
         ),
-        "sort_key": lambda m: -(m.get("douban_score") or 0),
+        "sort_key": lambda m: -(m.get("recommend_score") or 0),
         "hide_when_empty": False,
     },
     # 小众佳片: indie + score>0.
@@ -218,7 +219,7 @@ _SECTION_SPECS: dict[str, dict] = {
             and (m.get("douban_score") or 0) > 0
             and (m.get("watched") or 0) > 1000
         ),
-        "sort_key": lambda m: -(m.get("douban_score") or 0),
+        "sort_key": lambda m: -(m.get("recommend_score") or 0),
         "hide_when_empty": False,
     },
     # 电影日和: chain + recent release + no Douban score + has eiga rating,
@@ -234,15 +235,28 @@ _SECTION_SPECS: dict[str, dict] = {
             and _is_recent_release(m, today, days=365)
             and _year_diff(m, today) <= 3
         ),
-        "sort_key": lambda m: -(m.get("eiga_rating") or 0),
+        "sort_key": lambda m: -(m.get("recommend_score") or 0),
         "hide_when_empty": True,
     },
 }
 
 
+def _load_config() -> dict:
+    import yaml as _yaml
+    p = Path("config.yaml")
+    if not p.exists():
+        p = Path("config.yaml.example")
+    if not p.exists():
+        return {}
+    with p.open(encoding="utf-8") as f:
+        return _yaml.safe_load(f) or {}
+
+
 def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
     """Load all chain+indie movies with the fields needed for section filtering."""
     import json as _json
+
+    weights = load_ranking_weights(_load_config())
 
     # LEFT JOIN douban_matches so 电影日和 candidates without a Douban entry
     # still surface. Their predicate (douban_score == 0 + has eiga_rating)
@@ -253,6 +267,7 @@ def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
         "       mv.eiga_rating, mv.eiga_rating_count, "
         "       m.douban_id, m.douban_url, m.title_cn AS m_title_cn, "
         "       m.douban_score AS m_score, m.douban_year, "
+        "       m.imdb_score, m.imdb_votes, "
         "       d.title_cn AS d_title_cn, d.douban_score AS d_score, "
         "       d.douban_votes, d.director, d.cast, d.genre, "
         "       d.want_to_watch, d.watched, d.short_reviews "
@@ -272,6 +287,17 @@ def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
         except Exception:
             d["short_reviews"] = []
         d["_release_date_obj"] = _parse_jp_release_date(d.get("release_date"))
+        # 综合推荐度（0-100）：豆瓣 / IMDb / eiga.com 三来源贝叶斯加权融合，
+        # 用作各板块的排序依据（sort_key）。板块归属仍由各自 predicate 判定。
+        d["recommend_score"] = compute_recommend_score(
+            douban_score=d.get("douban_score") or 0,
+            douban_votes=d.get("douban_votes") or 0,
+            imdb_score=d.get("imdb_score") or 0,
+            imdb_votes=d.get("imdb_votes") or 0,
+            eiga_rating=d.get("eiga_rating") or 0,
+            eiga_votes=d.get("eiga_rating_count") or 0,
+            weights=weights,
+        )
         out.append(d)
     return out
 

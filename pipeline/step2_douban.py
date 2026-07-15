@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from pipeline.scoring import compute_recommend_score, load_ranking_weights
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path("data/eiga.db")
@@ -264,6 +266,15 @@ def _ensure_douban_table(conn: sqlite3.Connection):
             snapshot_at  TEXT,
             PRIMARY KEY (movie_id, snapshot_at)
         );
+        -- IMDb 评分历史，与 douban_matches_history 同构：一天一条快照。
+        CREATE TABLE IF NOT EXISTS imdb_score_history (
+            movie_id     TEXT,
+            imdb_id      TEXT,
+            imdb_score   REAL,
+            imdb_votes   INTEGER,
+            snapshot_at  TEXT,
+            PRIMARY KEY (movie_id, snapshot_at)
+        );
         CREATE TABLE IF NOT EXISTS douban_details (
             movie_id TEXT PRIMARY KEY,
             douban_id TEXT,
@@ -335,6 +346,20 @@ def _ensure_douban_table(conn: sqlite3.Connection):
         conn.commit()
     except Exception:
         pass
+    # IMDb id（从豆瓣页面 #info 的 "IMDb:" 行顺手取，不用额外请求）+ IMDb 评分/票数
+    # （另走 OMDb API，见 _refresh_imdb_score）。imdb_id 在 douban_matches 和
+    # douban_details 都存一份，跟 douban_id 的存法保持一致。
+    for table, col_def in (
+        ("douban_matches", "imdb_id TEXT"),
+        ("douban_matches", "imdb_score REAL"),
+        ("douban_matches", "imdb_votes INTEGER"),
+        ("douban_details", "imdb_id TEXT"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+            conn.commit()
+        except Exception:
+            pass
     conn.commit()
 
 
@@ -449,6 +474,77 @@ def _select_reviews_from_soup(soup, score_present: bool) -> list[dict]:
     return selected
 
 
+def _in_scope_movie_ids(conn: sqlite3.Connection) -> set:
+    """Movie ids currently showing at an active, tracked theater.
+
+    "Showing" = has a screenings row, dated today-or-yesterday (JST), against
+    a theater in step4's DISTRICTS that isn't logically deleted.
+
+    screenings rows are never deleted just because a film stopped screening —
+    step1 only prunes rows older than yesterday (and, by a separate quirk,
+    never touches rows with a NULL last_seen from before that column existed)
+    — so a plain "has a screenings row" join is NOT "showing now", it's
+    "ever shown here" (confirmed against the live DB: ~1170 movies match that
+    naively vs. ~350 with the date filter below). The last_seen>=yesterday
+    window matches step1's own staleness cutoff, with one day of slack for
+    theaters that haven't been rescanned yet in this cycle's rate-limited
+    rotation (see theater_scan_log).
+    """
+    from datetime import timezone
+    JST = timezone(timedelta(hours=9))
+    cutoff = (datetime.now(JST).date() - timedelta(days=1)).isoformat()
+
+    from pipeline.step4_export import DISTRICTS as _DISTRICTS
+    district_names = tuple(d["name"] for d in _DISTRICTS)
+    area_ph = ",".join("?" for _ in district_names) or "''"
+    rows = conn.execute(
+        f"""SELECT DISTINCT s.movie_id FROM screenings s
+             JOIN theaters t ON t.theater_id = s.theater_id
+            WHERE t.area IN ({area_ph}) AND t.delete_flg = 0
+              AND s.last_seen >= ?""",
+        district_names + (cutoff,),
+    ).fetchall()
+    return {r["movie_id"] for r in rows}
+
+
+def _refresh_imdb_score(conn: sqlite3.Connection, mid: str, imdb_id: str, now: str) -> None:
+    """Fetch + record today's IMDb rating for one movie via OMDb, once per day.
+
+    Mirrors the douban_matches_history cadence: a snapshot already stamped for
+    today means skip (no extra OMDb call); a failed/empty lookup writes
+    nothing, so it's retried automatically on the next run. No-op if
+    omdb.api_key isn't configured or imdb_id is empty.
+    """
+    if not imdb_id:
+        return
+    cfg = _load_config()
+    api_key = (cfg.get("omdb") or {}).get("api_key")
+    if not api_key:
+        return
+    today_str = now[:10]
+    already = conn.execute(
+        "SELECT 1 FROM imdb_score_history WHERE movie_id=? AND snapshot_at>=?",
+        (mid, today_str)
+    ).fetchone()
+    if already:
+        return
+    from scraper.imdb import fetch_imdb_rating
+    result = fetch_imdb_rating(imdb_id, api_key)
+    if not result:
+        return
+    conn.execute(
+        "UPDATE douban_matches SET imdb_score=?, imdb_votes=? WHERE movie_id=?",
+        (result["imdb_score"], result["imdb_votes"], mid)
+    )
+    conn.execute(
+        """INSERT OR IGNORE INTO imdb_score_history
+           (movie_id, imdb_id, imdb_score, imdb_votes, snapshot_at)
+           VALUES (?,?,?,?,?)""",
+        (mid, imdb_id, result["imdb_score"], result["imdb_votes"], now)
+    )
+    conn.commit()
+
+
 def match_movies(categories: tuple = ("chain", "indie"),
                  delay: float = 2.0,
                  resume: bool = True,
@@ -502,13 +598,17 @@ def match_movies(categories: tuple = ("chain", "indie"),
         if done_ids:
             logger.info("Resuming: %d already matched, skipping silently", len(done_ids))
 
-    # Get movies
+    # Get movies — scoped to those currently showing (see _in_scope_movie_ids).
+    # Once a film stops screening, matching/score-refresh simply stops touching
+    # it; its last known Douban/IMDb scores stand as-is.
+    scope_ids = _in_scope_movie_ids(conn)
     movies = conn.execute(
         "SELECT * FROM movies WHERE category IN ({}) ORDER BY category, rank".format(
             ",".join("?" for _ in categories)),
         categories
     ).fetchall()
-    logger.info("Total movies to match: %d (skipping %d already done)",
+    movies = [m for m in movies if m["movie_id"] in scope_ids]
+    logger.info("Total movies to match: %d currently showing (skipping %d already done)",
                 len(movies), len([m for m in movies if m["movie_id"] in done_ids]))
 
     results = {c: [] for c in categories}
@@ -539,7 +639,7 @@ def match_movies(categories: tuple = ("chain", "indie"),
                     logger.info("[%d/%d] %s | %s — refreshing score",
                                 i, len(movies), cat, mov["title_jp"])
                     try:
-                        from scraper.douban import _fetch_movie_page, _parse_rating
+                        from scraper.douban import _fetch_movie_page, _parse_rating, _extract_imdb_id
                         time.sleep(delay + random.uniform(0.5, delay * 0.6))
                         soup = _fetch_movie_page(existing["douban_id"], delay=0)
                         if soup:
@@ -565,6 +665,17 @@ def match_movies(categories: tuple = ("chain", "indie"),
                                    VALUES (?,?,?,?,?)""",
                                 (mid, existing["douban_id"], score, votes, now)
                             )
+                            # IMDb id lives on the same page (#info block) — grab it
+                            # for free while we're here, and refresh today's IMDb
+                            # rating alongside the Douban score (same once-a-day
+                            # cadence, same "currently showing" scope as this loop).
+                            imdb_id = _extract_imdb_id(soup) or (existing["imdb_id"] or "")
+                            if imdb_id and imdb_id != (existing["imdb_id"] or ""):
+                                conn.execute(
+                                    "UPDATE douban_matches SET imdb_id=? WHERE movie_id=?",
+                                    (imdb_id, mid)
+                                )
+                            _refresh_imdb_score(conn, mid, imdb_id, now)
                             conn.commit()
                         else:
                             score_tracker.record_failure()
@@ -840,23 +951,28 @@ def _save_douban_details(conn, mid: str, subject_id: str, soup,
     year_ok = _check_year_match(movie_year or 0, douban_year)
     country_ok = _check_country_match(movie_country or "", douban_country)
 
-    existing_score = conn.execute(
-        "SELECT douban_score FROM douban_matches WHERE movie_id=?", (mid,)
+    existing = conn.execute(
+        "SELECT douban_score, imdb_id FROM douban_matches WHERE movie_id=?", (mid,)
     ).fetchone()
-    keep_score = score or (existing_score and existing_score["douban_score"]) or 0
+    keep_score = score or (existing and existing["douban_score"]) or 0
+    # IMDb id comes free off the same #info block _parse_meta just read; keep
+    # the previously-known id if this fetch didn't find one (never blank it).
+    imdb_id = meta.get("imdb_id", "") or (existing and existing["imdb_id"]) or ""
 
     conn.execute(
         """UPDATE douban_matches SET
            title_cn=?, douban_score=?, douban_votes=?,
            director=?, cast=?, genre=?,
            douban_year=?, douban_country=?,
-           year_ok=?, country_ok=?, verified=MAX(?, verified)
+           year_ok=?, country_ok=?, verified=MAX(?, verified),
+           imdb_id=?
            WHERE movie_id=?""",
         (meta.get("title_cn", ""), keep_score, votes,
          meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
          douban_year, douban_country,
          1 if year_ok else 0, 1 if country_ok else 0,
          1 if (year_ok and country_ok) else 0,
+         imdb_id,
          mid)
     )
 
@@ -872,15 +988,20 @@ def _save_douban_details(conn, mid: str, subject_id: str, soup,
            (movie_id, douban_id, title_cn, douban_score, douban_votes,
             director, cast, genre, douban_year, douban_country, douban_url,
             want_to_watch, watched, trailer_urls, short_reviews, updated_at,
-            poster_url)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            poster_url, imdb_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (mid, subject_id, meta.get("title_cn", ""), score, votes,
          meta.get("director", ""), meta.get("cast", ""), meta.get("genre", ""),
          douban_year, douban_country,
          f"https://movie.douban.com/subject/{subject_id}/",
          meta.get("want_to_watch", 0) or 0, meta.get("watched", 0) or 0,
-         trailers_json, short_reviews_json, now, meta.get("poster", ""))
+         trailers_json, short_reviews_json, now, meta.get("poster", ""), imdb_id)
     )
+    # Refresh today's IMDb rating too (once/day, same as Douban's score
+    # history) — callers of this helper (enrich_all_movies / enrich_for_briefing
+    # / manual_set_match) are already scoped to currently-showing + briefing
+    # top-5, or are a one-off operator action, so no extra scope check needed here.
+    _refresh_imdb_score(conn, mid, imdb_id, now)
     return meta
 
 
@@ -1359,6 +1480,8 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
     if results is None:
         results = _load_results_from_db()
 
+    weights = load_ranking_weights(_load_config())
+
     lines = [
         f"# Step 2: 豆瓣マッチング結果 ({today})",
         "",
@@ -1373,8 +1496,8 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
         lines += [
             f"## {label} ({verified_count}本マッチ / {len(movies)}本中)",
             "",
-            "| # | Movie ID | Rank | タイトル | 原題 | 国(eiga) | 年 | 中文名 | 豆瓣分 | 評価数 | 監督 | 出演 |",
-            "|---|----------|------|---------|------|----------|-----|--------|--------|--------|------|------|",
+            "| # | Movie ID | Rank | タイトル | 原題 | 国(eiga) | 年 | 中文名 | 豆瓣分 | 評価数 | IMDb | 推荐度 | 監督 | 出演 |",
+            "|---|----------|------|---------|------|----------|-----|--------|--------|--------|------|--------|------|------|",
         ]
         for i, m in enumerate(movies, 1):
             mid = m.get("movie_id") or "-"
@@ -1405,6 +1528,27 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
                 director = ""
                 cast = ""
 
+            imdb_id = m.get("imdb_id") or ""
+            imdb_score = m.get("imdb_score") or 0
+            imdb_votes = m.get("imdb_votes") or 0
+            if imdb_id:
+                imdb_label = f"{imdb_id} ({imdb_score:.1f})" if imdb_score else imdb_id
+                imdb_cell = (f'<a href="https://www.imdb.com/title/{imdb_id}/" '
+                             f'target="_blank">{imdb_label}</a>')
+            else:
+                imdb_cell = "-"
+
+            recommend_score = compute_recommend_score(
+                douban_score=score if has_douban else 0,
+                douban_votes=votes if has_douban else 0,
+                imdb_score=imdb_score,
+                imdb_votes=imdb_votes,
+                eiga_rating=m.get("eiga_rating") or 0,
+                eiga_votes=m.get("eiga_rating_count") or 0,
+                weights=weights,
+            )
+            recommend_str = f"{recommend_score:.1f}" if recommend_score else "-"
+
             # Escape pipe characters in all text fields for MD table
             _p = lambda s: str(s).replace('|', '') if s else s
             mid_cell = (f'<a href="https://eiga.com/movie/{mid}/" target="_blank">{mid}</a>'
@@ -1412,7 +1556,7 @@ def generate_step2_md(results: Optional[dict] = None) -> Path:
             lines.append(
                 f"| {i} | {mid_cell} | {rank} | {_p(title)} | {_p(orig)} | {country_e} "
                 f"| {year_e} | {title_cn} | {score_str} "
-                f"| {votes} | {_p(director)} | {_p(cast)} |"
+                f"| {votes} | {imdb_cell} | {recommend_str} | {_p(director)} | {_p(cast)} |"
             )
 
         lines += ["", "---", ""]
@@ -1579,21 +1723,33 @@ def add_movie_to_skip_list(movie_id: str, reason: str = "no-douban-found") -> No
 
 
 def _load_results_from_db() -> dict:
-    """Load results from DB for MD generation (when called standalone)."""
+    """Load results from DB for MD generation (when called standalone).
+
+    Scoped to currently-screening movies (same ``_in_scope_movie_ids`` filter
+    ``match_movies`` uses) — the ``movies`` table otherwise accumulates every
+    chain/indie movie ever seen, most of which finished their run long ago
+    and are no longer touched by matching/score-refresh (see
+    ``_in_scope_movie_ids`` docstring). Without this filter the MD balloons
+    with stale entries that were never fetched with the newer fields (e.g.
+    imdb_id), which reads as "matching is broken" when it's really just
+    off-scope rows.
+    """
     conn = _get_db()
     _ensure_douban_table(conn)
+    scope_ids = _in_scope_movie_ids(conn)
     results = {"chain": [], "indie": []}
 
     for cat in ("chain", "indie"):
         movies = conn.execute(
             "SELECT m.*, d.douban_id, d.title_cn, d.douban_score, d.douban_votes, "
             "d.director, d.cast, d.genre, d.douban_year, d.douban_country, "
-            "d.douban_url, d.year_ok, d.country_ok, d.verified "
+            "d.douban_url, d.year_ok, d.country_ok, d.verified, "
+            "d.imdb_id, d.imdb_score, d.imdb_votes "
             "FROM movies m LEFT JOIN douban_matches d ON m.movie_id = d.movie_id "
             "WHERE m.category = ? ORDER BY m.rank",
             (cat,)
         ).fetchall()
-        results[cat] = [dict(r) for r in movies]
+        results[cat] = [dict(r) for r in movies if r["movie_id"] in scope_ids]
 
     conn.close()
     return results

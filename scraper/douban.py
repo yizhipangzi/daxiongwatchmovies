@@ -1532,6 +1532,20 @@ def _parse_rating(soup: BeautifulSoup) -> tuple[float, int]:
     return score, votes
 
 
+def _extract_imdb_id(soup: BeautifulSoup) -> str:
+    """IMDb id (e.g. 'tt1234567') from the Douban page's #info block, if present.
+
+    Lightweight standalone version of the same regex _parse_meta() uses, for
+    call sites that only fetch the page for a score refresh and don't want the
+    cost of a full _parse_meta() parse.
+    """
+    info_div = soup.select_one("#info")
+    if not info_div:
+        return ""
+    m = re.search(r"IMDb:\s*(tt\d+)", info_div.get_text())
+    return m.group(1) if m else ""
+
+
 def _parse_meta(soup: BeautifulSoup) -> dict:
     """Parse director, cast, genre, year, duration, country, titles, etc.
 
@@ -1600,6 +1614,9 @@ def _parse_meta(soup: BeautifulSoup) -> dict:
         # Detect TV series: pages with "集数:" are not movies
         if re.search(r"集数:\s*\d+", info_text):
             info["is_tv"] = True
+        im = re.search(r"IMDb:\s*(tt\d+)", info_text)
+        if im:
+            info["imdb_id"] = im.group(1)
 
     # --- Original title (from page h1) ---
     # Douban h1 usually: "中文名 OriginalTitle"
