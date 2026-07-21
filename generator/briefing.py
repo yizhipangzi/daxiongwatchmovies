@@ -111,13 +111,23 @@ def _briefing_format_movie(rank: int, m: dict, eiga_url: Optional[str],
 
 
 def _load_theaters_for_movie(conn, movie_id: str) -> list[dict]:
-    """Return deduplicated [{'name', 'url'}, ...] for a movie via screenings join."""
+    """Return deduplicated [{'name', 'url'}, ...] for a movie via screenings join.
+
+    ``screenings`` rows are kept forever as scan history (never purged), with
+    ``last_seen`` marking the most recent date a theater's schedule page
+    actually listed the movie. Without filtering on that, a theater that
+    dropped the movie weeks ago (e.g. a one-off classic re-release) would
+    still show up as "currently playing" indefinitely. Since step1 does a
+    full daily rescan of all theaters, only theaters confirmed on the latest
+    scan date are truly still showing the movie.
+    """
     try:
         rows = conn.execute(
             """SELECT DISTINCT t.name AS name, t.url AS url
                  FROM screenings s
                  JOIN theaters t ON s.theater_id = t.theater_id
                 WHERE s.movie_id = ?
+                  AND s.last_seen = (SELECT MAX(last_seen) FROM screenings)
                 ORDER BY t.name""",
             (movie_id,)
         ).fetchall()
@@ -274,7 +284,12 @@ def _load_briefing_candidates(conn, top_n: int = 5) -> list[dict]:
         "  FROM movies mv "
         "  LEFT JOIN douban_matches m ON m.movie_id = mv.movie_id "
         "  LEFT JOIN douban_details d ON d.movie_id = mv.movie_id "
-        " WHERE mv.category IN ('chain', 'indie')"
+        " WHERE mv.category IN ('chain', 'indie') "
+        "   AND EXISTS ("
+        "         SELECT 1 FROM screenings s"
+        "          WHERE s.movie_id = mv.movie_id"
+        "            AND s.last_seen = (SELECT MAX(last_seen) FROM screenings)"
+        "       )"
     ).fetchall()
     out: list[dict] = []
     for r in rows:
