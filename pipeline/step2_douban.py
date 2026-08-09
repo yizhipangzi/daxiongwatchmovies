@@ -475,34 +475,30 @@ def _select_reviews_from_soup(soup, score_present: bool) -> list[dict]:
 
 
 def _in_scope_movie_ids(conn: sqlite3.Connection) -> set:
-    """Movie ids currently showing at an active, tracked theater.
+    """Movie ids with a showtime today-or-later at an active, tracked theater.
 
-    "Showing" = has a screenings row, dated today-or-yesterday (JST), against
-    a theater in step4's DISTRICTS that isn't logically deleted.
-
-    screenings rows are never deleted just because a film stopped screening —
-    step1 only prunes rows older than yesterday (and, by a separate quirk,
-    never touches rows with a NULL last_seen from before that column existed)
-    — so a plain "has a screenings row" join is NOT "showing now", it's
-    "ever shown here" (confirmed against the live DB: ~1170 movies match that
-    naively vs. ~350 with the date filter below). The last_seen>=yesterday
-    window matches step1's own staleness cutoff, with one day of slack for
-    theaters that haven't been rescanned yet in this cycle's rate-limited
-    rotation (see theater_scan_log).
+    "In scope" = has a showtimes row with show_date >= today (JST), against
+    a theater in step4's DISTRICTS that isn't logically deleted. Uses
+    showtimes (actual dated screenings, populated a week out by step1's
+    weekly-schedule scrape) rather than screenings (a movie/theater pairing
+    whose last_seen only records when it was last confirmed listed, not
+    whether it still has upcoming showtimes) — a film that finished its run
+    can linger in screenings until the next prune, but drops out of
+    showtimes as soon as its last dated slot is in the past.
     """
     from datetime import timezone
     JST = timezone(timedelta(hours=9))
-    cutoff = (datetime.now(JST).date() - timedelta(days=1)).isoformat()
+    today = datetime.now(JST).date().isoformat()
 
     from pipeline.step4_export import DISTRICTS as _DISTRICTS
     district_names = tuple(d["name"] for d in _DISTRICTS)
     area_ph = ",".join("?" for _ in district_names) or "''"
     rows = conn.execute(
-        f"""SELECT DISTINCT s.movie_id FROM screenings s
+        f"""SELECT DISTINCT s.movie_id FROM showtimes s
              JOIN theaters t ON t.theater_id = s.theater_id
             WHERE t.area IN ({area_ph}) AND t.delete_flg = 0
-              AND s.last_seen >= ?""",
-        district_names + (cutoff,),
+              AND s.show_date >= ?""",
+        district_names + (today,),
     ).fetchall()
     return {r["movie_id"] for r in rows}
 
@@ -1041,11 +1037,11 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
     now = datetime.now().isoformat(timespec="seconds")
     cutoff = (datetime.now() - timedelta(days=refresh_days)).isoformat(timespec="seconds")
 
-    # 范围 = 匹配上豆瓣(verified) 且（在小程序那些区有排片 或 是 briefing 的 top5）。
-    # 区名以 step4 的 DISTRICTS 为单一来源（现在覆盖首都圏4都県全部活跃影院，
-    # 不再是老的东京9区子集）；briefing top5 即使不在这些区也要 enrich（简报要用）。
-    from pipeline.step4_export import DISTRICTS as _DISTRICTS
-    district_names = tuple(d["name"] for d in _DISTRICTS)
+    # 范围 = 匹配上豆瓣(verified) 且（今天或以后在小程序那些区有排片 或 是 briefing
+    # 的 top5）。「今天或以后有排片」用 _in_scope_movie_ids（showtimes.show_date
+    # >= 今天），与 step2 的 match_movies 同一口径；briefing top5 即使不在这些区
+    # 也要 enrich（简报要用）。
+    scope_ids = tuple(_in_scope_movie_ids(conn))
     try:
         from generator.briefing import select_briefing_movie_ids
         briefing_ids = tuple(select_briefing_movie_ids(top_n=5))
@@ -1053,7 +1049,7 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
         briefing_ids = ()
 
     cat_ph = ",".join("?" for _ in categories)
-    area_ph = ",".join("?" for _ in district_names) or "''"
+    scope_ph = ",".join("?" for _ in scope_ids) or "''"
     brief_ph = ",".join("?" for _ in briefing_ids) or "''"
     # Verified matches in scope, with their last detail-fetch time.
     # NULL updated_at (never enriched) sorts first; then oldest first.
@@ -1069,15 +1065,11 @@ def enrich_all_movies(categories: tuple = ("chain", "indie"),
              WHERE m.douban_id IS NOT NULL AND m.douban_id != ''
                AND mv.category IN ({cat_ph})
                AND (
-                   m.movie_id IN (
-                       SELECT s.movie_id FROM screenings s
-                       JOIN theaters t ON t.theater_id = s.theater_id
-                       WHERE t.area IN ({area_ph}) AND t.delete_flg = 0
-                   )
+                   m.movie_id IN ({scope_ph})
                    OR m.movie_id IN ({brief_ph})
                )
              ORDER BY (d.updated_at IS NOT NULL), d.updated_at, mv.rank""",
-        tuple(categories) + district_names + briefing_ids,
+        tuple(categories) + scope_ids + briefing_ids,
     ).fetchall()
 
     def _needs_fetch(r) -> bool:

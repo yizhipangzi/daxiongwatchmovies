@@ -95,12 +95,19 @@ def cmd_manual_set(args):
         deleted = conn.execute(
             "DELETE FROM douban_matches WHERE movie_id=?", (movie_id,)
         ).rowcount
+        # Also clear douban_details — the briefing prefers its title/score/watched
+        # over douban_matches, so a stale detail row would keep the wrong match
+        # showing up even after douban_matches is cleared.
+        deleted_details = conn.execute(
+            "DELETE FROM douban_details WHERE movie_id=?", (movie_id,)
+        ).rowcount
         conn.commit()
         conn.close()
         reason = args.reason or "no-douban-entry"
         add_movie_to_skip_list(movie_id, reason=reason)
         print(f"✅ Marked {movie_id} ({title}) as having no Douban entry")
-        print(f"   cleared {deleted} match row | added to skip list (reason='{reason}')")
+        print(f"   cleared {deleted} match row + {deleted_details} details row | "
+              f"added to skip list (reason='{reason}')")
         return
 
     try:
