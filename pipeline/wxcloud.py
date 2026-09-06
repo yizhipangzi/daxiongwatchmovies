@@ -50,16 +50,32 @@ def get_access_token(config: dict) -> str:
         except Exception:
             pass
 
-    resp = requests.post(STABLE_TOKEN_URL, json={
-        "grant_type": "client_credential",
-        "appid": app_id,
-        "secret": app_secret,
-        "force_refresh": False,
-    }, timeout=_META_TIMEOUT)
-    data = resp.json()
-    token = data.get("access_token")
-    if not token:
-        raise RuntimeError(f"获取 access_token 失败: {data}")
+    # 取 token 本身也走公网，跨境偶发抖动一样会打中它——之前这里没有重试，
+    # 单次超时/连接失败就直接把整个同步（进而整个 step1）带崩。补上和
+    # upload/download 一致的重试。
+    last = None
+    data = None
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            resp = requests.post(STABLE_TOKEN_URL, json={
+                "grant_type": "client_credential",
+                "appid": app_id,
+                "secret": app_secret,
+                "force_refresh": False,
+            }, timeout=_META_TIMEOUT)
+            data = resp.json()
+            if not data.get("access_token"):
+                raise RuntimeError(f"获取 access_token 失败: {data}")
+            break
+        except Exception as exc:
+            last = exc
+            data = None
+            logger.warning("获取 access_token 第 %d/%d 次失败: %s", attempt, _RETRIES, exc)
+            if attempt < _RETRIES:
+                time.sleep(5 * attempt)
+    if data is None:
+        raise RuntimeError(f"获取 access_token 重试 {_RETRIES} 次仍失败: {last}")
+    token = data["access_token"]
     try:
         cache_file.write_text(json.dumps({
             "app_id": app_id,

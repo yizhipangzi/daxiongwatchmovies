@@ -12,6 +12,10 @@ VM / 本地 / step4 之间的同步中枢：
 
 复用 step4_export 里的云存储基建（access_token / 上传），这里补「下载」。
 
+跨境带宽有限时整文件一次抖动就可能重试耗尽、整个同步失败——所以传输时按
+_CHUNK_SIZE 拆成小块分别传（各自独立重试 + sha256 校验），拼回后仍是同一个
+sqlite 文件；见 push_db / pull_db 顶部注释。
+
 ⚠️ 整文件同步是「最后写的赢」。VM cron 与本地尽量错峰，避免并发互相覆盖。
 """
 from __future__ import annotations
@@ -40,6 +44,22 @@ _STAMP_KEY = "cloud_last_success_date"
 # DB 里记录「本次推送版本戳」（run_state）。push 时写入并随库上传，同时单独存进
 # 云端 meta 文件；pull 先读 meta 对比本地此值，一致说明云端没更新 → 跳过下载整库。
 _PUSHED_KEY = "db_pushed_at"
+
+# 海外 VM ↔ 腾讯云存储带宽有限：整库当一个文件传，一次抖动就可能把 wxcloud
+# 里的 3 次重试全部耗光，导致"数据库同步"整体失败。拆成小块后，每块仍各自享有
+# wxcloud.upload/download 自己的 3 次重试，一块失败不牵连其它已传成功的块，
+# 大幅降低"整库同步彻底失败"的概率。块 0 沿用主文件路径（不加 .partN 后缀），
+# 保证已部署 config.yaml 里的 db_fileid 不用迁移；没有 manifest（老格式/云端
+# 还是旧版本传的单文件）时退化为按 1 块处理，兼容旧数据。
+_CHUNK_SIZE = 1_500_000  # 每块约 1.5MB（gzip 后）
+
+
+def _part_path(cloud_path: str, i: int) -> str:
+    return cloud_path if i == 0 else f"{cloud_path}.part{i}"
+
+
+def _part_fileid(base_fileid: str, i: int) -> str:
+    return base_fileid if i == 0 else f"{base_fileid}.part{i}"
 
 
 def today_jst() -> str:
@@ -115,7 +135,7 @@ def backup_db(config: dict, keep_days: int = 7, db_path: Path = DB_PATH) -> Opti
         return None
     token = wxcloud.get_access_token(config)
     _checkpoint_wal(db_path)
-    gz = gzip.compress(Path(db_path).read_bytes(), compresslevel=6)
+    gz = gzip.compress(Path(db_path).read_bytes(), compresslevel=9)
     base = datetime.now(timezone(timedelta(hours=9))).date()  # JST
     backup_path = f"db/backup/eiga-{base.strftime('%Y%m%d')}.db"
     fid = wxcloud.upload(env, token, backup_path, gz)
@@ -139,7 +159,12 @@ def backup_db(config: dict, keep_days: int = 7, db_path: Path = DB_PATH) -> Opti
 
 
 def push_db(config: dict, db_path: Path = DB_PATH) -> str:
-    """上传本地 eiga.db 到云存储，返回 file_id。"""
+    """上传本地 eiga.db 到云存储，返回 file_id。
+
+    大文件按 _CHUNK_SIZE 拆块分别上传，每块独立重试（见模块顶部注释），跨境
+    带宽有限时比整块传输更抗抖动。manifest(.meta.json) 记录版本戳 + 块数 +
+    每块 sha256，供 pull 端跳过未更新的库、按块校验并拼回原文件。
+    """
     mp = wxcloud.mp_cfg(config)
     env = mp.get("cloud_env", "")
     if not env:
@@ -154,20 +179,44 @@ def push_db(config: dict, db_path: Path = DB_PATH) -> str:
     _checkpoint_wal(db_path)  # 把 WAL 合并进主库，避免漏掉最近提交
     # gzip 压缩再传：SQLite 压缩率高，几 MB 能压到几百 KB，避免 COS 因传太慢
     # 报 UserNetworkTooSlow（文件越小越快传完）。pull 端按 gzip 魔数自动解压。
+    # compresslevel=9（原 6）：同样的一次性 CPU 换更小的传输体积，对偶尔跑一次
+    # 的同步来说很划算。
     raw = Path(db_path).read_bytes()
-    gz = gzip.compress(raw, compresslevel=6)
-    fid = wxcloud.upload(env, token, cloud_path, gz)
-    # 极小 meta：只放版本戳。pull 端先读它对比本地，没更新就不下载整库。
+    gz = gzip.compress(raw, compresslevel=9)
+
+    parts = [gz[i:i + _CHUNK_SIZE] for i in range(0, len(gz), _CHUNK_SIZE)] or [b""]
+    part_hashes = []
+    fid = ""
+    for i, part in enumerate(parts):
+        pf = wxcloud.upload(env, token, _part_path(cloud_path, i), part)
+        part_hashes.append(hashlib.sha256(part).hexdigest())
+        if i == 0:
+            fid = pf  # 块 0 沿用主文件路径，file_id 与旧的单文件格式兼容
+
+    # manifest：版本戳 + 块数 + 每块 sha256。pull 端先读它对比本地版本，没更新
+    # 就不下载；下载完按 sha256 逐块校验，任何一块传输损坏都能立刻发现。
+    manifest = {"pushed_at": pushed_at, "parts": len(parts), "sha256": part_hashes}
     try:
         wxcloud.upload(env, token, cloud_path + ".meta.json",
-                       json.dumps({"pushed_at": pushed_at}).encode("utf-8"))
+                       json.dumps(manifest).encode("utf-8"))
     except Exception as exc:
         logger.warning("push_db: meta 上传失败（不影响主库同步）: %s", exc)
+
+    # 清理云端多余的旧尾块（比如库变小了、这次块数比上次少）。找不到 prefix
+    # 或删除失败都不致命——顶多云存储里留几个没人再引用的孤儿块。
+    if fid and fid.endswith(cloud_path):
+        prefix = fid[: -len(cloud_path)]
+        stale = [prefix + _part_path(cloud_path, i) for i in range(len(parts), len(parts) + 20)]
+        try:
+            wxcloud.delete(env, token, stale)
+        except Exception as exc:
+            logger.debug("push_db: 清理旧尾块失败（忽略）: %s", exc)
+
     # 同一路径上传 file_id 稳定；首次拿到就回写 config 方便以后 pull。
     if fid and fid != _db_fileid(config):
         _save_db_fileid_to_config(fid)
-    logger.info("push_db: %s → %s (%d → %d bytes, gzip, v=%s)",
-                db_path, cloud_path, len(raw), len(gz), pushed_at)
+    logger.info("push_db: %s → %s (%d → %d bytes, gzip, %d 块, v=%s)",
+                db_path, cloud_path, len(raw), len(gz), len(parts), pushed_at)
     return fid
 
 
@@ -272,6 +321,12 @@ def _restore_manual_data(db_path: Path, snap: dict) -> int:
 def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
     """从云存储下载 eiga.db 覆盖本地。云上还没有则返回 False（首次需先 init/push）。
 
+    大文件按块下载（见 push_db / 模块顶部注释），单块失败只重试自己，跨境带宽
+    有限时更抗抖动；拼回后按 manifest 的 sha256 逐块校验，任何一块对不上就整体
+    判失败——返回 False、不覆盖本地（保留旧库，等下次重试），绝不用half传完
+    的坏数据覆盖能用的本地库。manifest 读不到（旧库/云端还是没分块前传的）时
+    退化为按 1 块处理，兼容旧数据，无需手动迁移。
+
     覆盖前会快照本地手动匹配 (manual=1)，覆盖后回灌，避免整库同步把本地刚做、
     尚未 push 的手动匹配冲掉（本地优先）。
     """
@@ -286,21 +341,31 @@ def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
     token = wxcloud.get_access_token(config)
 
     # 下载前先对比版本：读云端极小 meta（秒下），版本和本地一致说明云端没更新，
-    # 跳过整库下载（省跨境流量/时间）。meta 读不到（旧库/首次）就回退照常下载。
+    # 跳过整库下载（省跨境流量/时间）。meta 读不到（旧库/首次）就回退按 1 块下载。
+    manifest = None
     try:
         meta_bytes = wxcloud.download(env, token, fileid + ".meta.json")
-        cloud_v = json.loads(meta_bytes).get("pushed_at")
+        manifest = json.loads(meta_bytes)
+        cloud_v = manifest.get("pushed_at")
         local_v = _get_run_state(db_path, _PUSHED_KEY)
         if cloud_v and local_v and str(cloud_v) == str(local_v):
             logger.info("pull_db: 云端未更新（版本一致 v=%s），跳过下载", cloud_v)
             return True
     except Exception as exc:
-        logger.debug("pull_db: 读 meta 失败，照常下载整库: %s", exc)
+        logger.debug("pull_db: 读 meta 失败，按旧的单文件格式下载: %s", exc)
 
+    n_parts = (manifest or {}).get("parts") or 1
+    part_hashes = (manifest or {}).get("sha256") or []
     try:
-        content = wxcloud.download(env, token, fileid)
+        chunks = []
+        for i in range(n_parts):
+            part = wxcloud.download(env, token, _part_fileid(fileid, i))
+            if i < len(part_hashes) and hashlib.sha256(part).hexdigest() != part_hashes[i]:
+                raise RuntimeError(f"第 {i+1}/{n_parts} 块 sha256 校验不符（传输损坏）")
+            chunks.append(part)
+        content = b"".join(chunks)
     except Exception as exc:
-        logger.warning("pull_db: 下载失败（可能云上还没有），跳过: %s", exc)
+        logger.warning("pull_db: 下载失败（可能云上还没有，或跨境网络抖动），跳过: %s", exc)
         return False
     # 按 gzip 魔数（1f 8b）自动解压；旧的未压缩文件（裸 sqlite）原样用，兼容过渡。
     if content[:2] == b"\x1f\x8b":
