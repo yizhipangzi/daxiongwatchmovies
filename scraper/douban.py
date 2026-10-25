@@ -1256,11 +1256,11 @@ def _norm(s: str) -> str:
     return re.sub(r"[\s\W]+", "", s or "").lower()
 
 
-def _year_ok(year: int, result: dict) -> bool:
+def _year_ok(year: int, result: dict, tolerance: int = 2) -> bool:
     if not year or not result.get("year"):
         return True
     try:
-        return abs(year - int(result["year"])) <= 2
+        return abs(year - int(result["year"])) <= tolerance
     except (ValueError, TypeError):
         return True
 
@@ -1384,7 +1384,8 @@ def search_douban(title_jp: str, year: int = 0,
                   delay: float = 1.5,
                   movie: Optional[MovieInfo] = None,
                   orig_title: Optional[str] = None,
-                  country: Optional[str] = None) -> Optional[dict]:
+                  country: Optional[str] = None,
+                  strict_year: bool = False) -> Optional[dict]:
     """Search Douban by Japanese movie title; return the best match dict.
 
     Search order:
@@ -1394,7 +1395,23 @@ def search_douban(title_jp: str, year: int = 0,
     Each query tries suggest API first, web search as fallback.
     Year +/-2 and title substring match are required; page-level validation
     is used as a fallback when the fast title check fails.
+
+    ``strict_year``: require an EXACT year match instead of the usual ±2
+    tolerance. Set this when ``title_jp`` had an explicit "（YYYY）" year
+    disambiguator stripped before calling (see pipeline.step2_douban.match_movies) —
+    that suffix exists specifically because eiga.com has another, differently
+    dated movie with the exact same title (e.g. a same-titled remake/新作
+    released years apart from an original). Douban can carry the same
+    collision (two subjects, identical title text, different year): with the
+    normal ±2 tolerance and an ambiguous bare title, the wrong one gets
+    picked whenever Douban's suggest index doesn't happen to surface both
+    candidates for disambiguation. Ordinary (non-colliding) titles keep the
+    ±2 leniency since eiga's own release year can legitimately differ a bit
+    from Douban's.
     """
+    _year_tol = 0 if strict_year else 2
+    def _ok(r: dict) -> bool:
+        return _year_ok(year, r, tolerance=_year_tol)
     if not orig_title:
         from .title_resolver import resolve_original_title
         if movie is not None:
@@ -1426,7 +1443,7 @@ def search_douban(title_jp: str, year: int = 0,
                 continue
             tried.add(q)
             r = _search_douban_by_query(q, year, delay)
-            if r and _year_ok(year, r):
+            if r and _ok(r):
                 return r
         if year:
             for q in qs:
@@ -1437,12 +1454,12 @@ def search_douban(title_jp: str, year: int = 0,
                     continue
                 tried.add(fq)
                 r = _search_douban_by_query(fq, year, delay)
-                if r and _year_ok(year, r):
+                if r and _ok(r):
                     return r
         return None
 
     result = _try_queries(queries)
-    if result and _year_ok(year, result):
+    if result and _ok(result):
         if orig_title and not _title_ok(result, orig_title) and not is_jp:
             logger.debug("Douban: fast title check failed (got %r, want %r), fetching page",
                          result.get("title"), orig_title)
@@ -1463,7 +1480,7 @@ def search_douban(title_jp: str, year: int = 0,
         if cleaned and cleaned != title_jp:
             logger.info("Douban: fallback search with cleaned JP title %r", cleaned)
             result = _try_queries([cleaned])
-            if result and _year_ok(year, result):
+            if result and _ok(result):
                 return result
 
     # Fallback: strip diacritics (e.g. "Kék Pelikán" → "Kek Pelikan")
@@ -1472,7 +1489,7 @@ def search_douban(title_jp: str, year: int = 0,
         if normalized and normalized != orig_title:
             logger.info("Douban: diacritic-normalized fallback %r (was %r)", normalized, orig_title)
             result = _try_queries([normalized])
-            if result and _year_ok(year, result):
+            if result and _ok(result):
                 return result
 
     # Final fallback: Playwright-rendered browser search.
@@ -1502,7 +1519,7 @@ def search_douban(title_jp: str, year: int = 0,
             pw_queries.append(stripped)
         for pq in pw_queries:
             result = _search_web_playwright(pq, year=year)
-            if result and _year_ok(year, result):
+            if result and _ok(result):
                 return result
 
     return None

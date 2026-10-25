@@ -360,7 +360,34 @@ def _ensure_douban_table(conn: sqlite3.Connection):
             conn.commit()
         except Exception:
             pass
+    # 「今天已检查过」日期戳，与 douban_matches_history/imdb_score_history 是否
+    # 写新行彻底解耦：history 现在只在分数/票数相对上一条真的变化时才写一行
+    # （见 _refresh_imdb_score / match_movies 的 refresh 分支），不能再用
+    # "history 里有今天的行" 来判断"今天是否已经抓过"——没变化就不会有今天的
+    # 行，会导致同一天反复请求。这两个戳专门记录"今天抓过"，与是否变化无关。
+    for col_def in ("score_checked_at TEXT", "imdb_checked_at TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE douban_matches ADD COLUMN {col_def}")
+            conn.commit()
+        except Exception:
+            pass
     conn.commit()
+
+
+def _history_unchanged(conn: sqlite3.Connection, table: str, score_col: str, votes_col: str,
+                       mid: str, score, votes) -> bool:
+    """True if (score, votes) equals the most recent snapshot_at row for this movie.
+
+    No prior row → always considered "changed" (caller writes the first/baseline row).
+    """
+    row = conn.execute(
+        f"SELECT {score_col} AS s, {votes_col} AS v FROM {table} "
+        f"WHERE movie_id=? ORDER BY snapshot_at DESC LIMIT 1",
+        (mid,)
+    ).fetchone()
+    if row is None:
+        return False
+    return (row["s"] or 0) == (score or 0) and (row["v"] or 0) == (votes or 0)
 
 
 def _load_config(path: str = "config.yaml") -> dict:
@@ -504,12 +531,15 @@ def _in_scope_movie_ids(conn: sqlite3.Connection) -> set:
 
 
 def _refresh_imdb_score(conn: sqlite3.Connection, mid: str, imdb_id: str, now: str) -> None:
-    """Fetch + record today's IMDb rating for one movie via OMDb, once per day.
+    """Fetch today's IMDb rating for one movie via OMDb, once per day.
 
-    Mirrors the douban_matches_history cadence: a snapshot already stamped for
-    today means skip (no extra OMDb call); a failed/empty lookup writes
-    nothing, so it's retried automatically on the next run. No-op if
-    omdb.api_key isn't configured or imdb_id is empty.
+    "Once per day" is tracked by douban_matches.imdb_checked_at — independent
+    of whether a history row gets written. A history row is only appended when
+    the score/votes actually differ from the last snapshot (see
+    _history_unchanged), so imdb_score_history only grows on real change
+    instead of once per movie per day regardless. A failed/empty lookup
+    doesn't stamp imdb_checked_at, so it's retried automatically on the next
+    run. No-op if omdb.api_key isn't configured or imdb_id is empty.
     """
     if not imdb_id:
         return
@@ -518,26 +548,27 @@ def _refresh_imdb_score(conn: sqlite3.Connection, mid: str, imdb_id: str, now: s
     if not api_key:
         return
     today_str = now[:10]
-    already = conn.execute(
-        "SELECT 1 FROM imdb_score_history WHERE movie_id=? AND snapshot_at>=?",
-        (mid, today_str)
+    checked = conn.execute(
+        "SELECT imdb_checked_at FROM douban_matches WHERE movie_id=?", (mid,)
     ).fetchone()
-    if already:
+    if checked and checked["imdb_checked_at"] == today_str:
         return
     from scraper.imdb import fetch_imdb_rating
     result = fetch_imdb_rating(imdb_id, api_key)
     if not result:
         return
     conn.execute(
-        "UPDATE douban_matches SET imdb_score=?, imdb_votes=? WHERE movie_id=?",
-        (result["imdb_score"], result["imdb_votes"], mid)
+        "UPDATE douban_matches SET imdb_score=?, imdb_votes=?, imdb_checked_at=? WHERE movie_id=?",
+        (result["imdb_score"], result["imdb_votes"], today_str, mid)
     )
-    conn.execute(
-        """INSERT OR IGNORE INTO imdb_score_history
-           (movie_id, imdb_id, imdb_score, imdb_votes, snapshot_at)
-           VALUES (?,?,?,?,?)""",
-        (mid, imdb_id, result["imdb_score"], result["imdb_votes"], now)
-    )
+    if not _history_unchanged(conn, "imdb_score_history", "imdb_score", "imdb_votes",
+                              mid, result["imdb_score"], result["imdb_votes"]):
+        conn.execute(
+            """INSERT OR IGNORE INTO imdb_score_history
+               (movie_id, imdb_id, imdb_score, imdb_votes, snapshot_at)
+               VALUES (?,?,?,?,?)""",
+            (mid, imdb_id, result["imdb_score"], result["imdb_votes"], now)
+        )
     conn.commit()
 
 
@@ -624,11 +655,10 @@ def match_movies(categories: tuple = ("chain", "indie"),
             if existing and existing["douban_id"]:
                 today_str = now[:10]
                 # A successful page fetch today (even if score=0) counts as "done".
-                # Failed fetches don't write a history row, so they retry automatically.
-                refreshed_today = conn.execute(
-                    "SELECT 1 FROM douban_matches_history WHERE movie_id=? AND snapshot_at>=?",
-                    (mid, today_str)
-                ).fetchone()
+                # Tracked via score_checked_at (independent of whether a history
+                # row gets written — see _history_unchanged below): a failed fetch
+                # doesn't stamp it, so it retries automatically on the next run.
+                refreshed_today = existing["score_checked_at"] == today_str
                 if refreshed_today:
                     _skipped_refreshed_today += 1
                 elif score_tracker.should_continue():
@@ -653,14 +683,29 @@ def match_movies(categories: tuple = ("chain", "indie"),
                                 logger.info("[%d/%d] %s | %s — page fetched, no rating yet",
                                             i, len(movies), cat, mov["title_jp"])
                             score_tracker.record_success()
-                            # Record the successful fetch (score may be 0). Page fetch
-                            # success is what marks the movie as "done today".
+                            # Page fetch success marks the movie "done today" —
+                            # stamped unconditionally so it isn't re-fetched again
+                            # today, regardless of whether the score changed.
                             conn.execute(
-                                """INSERT OR IGNORE INTO douban_matches_history
-                                   (movie_id, douban_id, douban_score, douban_votes, snapshot_at)
-                                   VALUES (?,?,?,?,?)""",
-                                (mid, existing["douban_id"], score, votes, now)
+                                "UPDATE douban_matches SET score_checked_at=? WHERE movie_id=?",
+                                (today_str, mid)
                             )
+                            # History row only on real change vs. the last snapshot
+                            # (optimization: a daily cron was writing one row per
+                            # movie per day even when the score never moved).
+                            # score==0 means this fetch didn't parse a rating (bot
+                            # page / no score yet) — never log that as a "dropped
+                            # to 0" data point, same guard as douban_matches above.
+                            if score and not _history_unchanged(
+                                conn, "douban_matches_history",
+                                "douban_score", "douban_votes", mid, score, votes
+                            ):
+                                conn.execute(
+                                    """INSERT OR IGNORE INTO douban_matches_history
+                                       (movie_id, douban_id, douban_score, douban_votes, snapshot_at)
+                                       VALUES (?,?,?,?,?)""",
+                                    (mid, existing["douban_id"], score, votes, now)
+                                )
                             # IMDb id lives on the same page (#info block) — grab it
                             # for free while we're here, and refresh today's IMDb
                             # rating alongside the Douban score (same once-a-day
@@ -691,9 +736,21 @@ def match_movies(categories: tuple = ("chain", "indie"),
 
         # Only movies that will actually be searched get logged
         title_jp = mov["title_jp"]
+        # eiga.com appends "（YYYY）" to one of two movies that otherwise share
+        # the exact same title — e.g. a new film with the same name as an
+        # older one. We strip it before querying Douban (the bare title
+        # usually searches better), which throws away that disambiguating
+        # signal. If Douban carries the same title collision (two subjects,
+        # identical title text, different years — seen in practice with
+        # ルックバック: a 2026 title-sharer vs. ルックバック（2024）), the
+        # normal ±2-year tolerance can accept the WRONG one whenever Douban's
+        # suggest index doesn't surface both candidates together. Detect the
+        # stripped suffix and require an exact year match in that case.
+        year_suffix_m = re.search(r'[（(](\d{4})[）)]$', title_jp)
         title_jp_clean = re.sub(r'[（(]\d{4}[）)]$', '', title_jp).strip()
         title_orig = mov["title_original"] or ""
         year = mov["year"] or 0
+        strict_year = bool(year_suffix_m)
 
         # Inter-movie pause: simulate a human pausing between searches
         _search_count += 1
@@ -711,7 +768,8 @@ def match_movies(categories: tuple = ("chain", "indie"),
         try:
             match = search_douban(title_jp_clean, year=year, delay=delay,
                                   orig_title=title_orig or None,
-                                  country=mov["country"] or None)
+                                  country=mov["country"] or None,
+                                  strict_year=strict_year)
 
             if not match:
                 # Record the attempt so the unmatched table can show it;
@@ -771,14 +829,14 @@ def match_movies(categories: tuple = ("chain", "indie"),
                 """INSERT OR REPLACE INTO douban_matches
                    (movie_id, douban_id, title_cn, douban_score, douban_votes,
                     director, cast, genre, douban_year, douban_country, douban_url,
-                    year_ok, country_ok, verified, matched_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    year_ok, country_ok, verified, matched_at, score_checked_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (mid, subject_id, result["title_cn"], score, votes,
                  "", "", "", suggest_year, "", result["douban_url"],
-                 result["year_ok"], 0, result["verified"], now)
+                 result["year_ok"], 0, result["verified"], now, today_str)
             )
-            # The suggest API returned a result — stamp history so this movie is
-            # marked "done today" even if the suggest score is 0 (no ratings yet).
+            # First-ever snapshot for this movie — always written as the baseline
+            # the later refresh branch's _history_unchanged() compares against.
             conn.execute(
                 """INSERT OR REPLACE INTO douban_matches_history
                    (movie_id, douban_id, douban_score, douban_votes, snapshot_at)

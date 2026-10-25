@@ -109,6 +109,63 @@ def _load_douban(conn: sqlite3.Connection) -> tuple[dict, dict]:
     return details, matches
 
 
+# 一部电影的豆瓣分数趋势最多输出这么多个拐点，JSON 别无限变长。
+# （有这么多次真实变化已经很罕见；超出时等距抽样，首尾必留。）
+_SCORE_TREND_MAX_POINTS = 12
+
+
+def _score_trend_points(rows: list) -> list[dict]:
+    """把一部电影的 douban_matches_history 行（按 snapshot_at 升序）压缩成
+    「只在分数变化时取一个点」的拐点序列：[{date, score}, ...]。
+
+    pipeline.step2_douban 现在只在分数真的变化时才写一行（见 _history_unchanged），
+    但老数据 / 迁移前写入的行仍可能连续多天同分——这里按分数去重作为兜底，
+    不依赖 history 表本身已经去重。少于 2 个拐点（从未变化过）返回空列表，
+    调用方据此不输出该字段（只给「有变化」的电影）。
+
+    score<=0 的行一律跳过：那是抓取失败/未解析到评分（机器人验证页等）的产物，
+    不是真的"豆瓣分跌到 0"——旧数据里混有这类行（修复前每天无条件写一行），
+    混进拐点会显示假的跳水。
+    """
+    points: list[dict] = []
+    prev = None
+    for r in rows:
+        score = round(float(r["douban_score"] or 0), 1)
+        if score <= 0:
+            continue
+        if prev is not None and score == prev:
+            continue
+        points.append({"date": (r["snapshot_at"] or "")[:10], "score": score})
+        prev = score
+    if len(points) < 2:
+        return []
+    if len(points) > _SCORE_TREND_MAX_POINTS:
+        # 等距抽样到上限个点，首尾强制保留，避免长线型电影把 JSON 拖得很大。
+        last = len(points) - 1
+        step = last / (_SCORE_TREND_MAX_POINTS - 1)
+        idx = sorted({round(i * step) for i in range(_SCORE_TREND_MAX_POINTS)})
+        points = [points[i] for i in idx]
+    return points
+
+
+def _load_douban_score_trends(conn: sqlite3.Connection) -> dict:
+    """返回 {movie_id: [拐点,...]}；只含「真的变化过」的电影（见 _score_trend_points）。"""
+    out: dict = {}
+    if not _table_exists(conn, "douban_matches_history"):
+        return out
+    by_movie: dict = {}
+    for r in conn.execute(
+        "SELECT movie_id, douban_score, snapshot_at FROM douban_matches_history "
+        "ORDER BY movie_id, snapshot_at"
+    ):
+        by_movie.setdefault(r["movie_id"], []).append(r)
+    for mid, rows in by_movie.items():
+        points = _score_trend_points(rows)
+        if points:
+            out[mid] = points
+    return out
+
+
 def _load_eiga_reviews(conn: sqlite3.Connection, n: int = 3) -> dict:
     """返回 {movie_id: [短评文本,...]}（每片最多 n 条）。豆瓣没匹配到时用作短评来源。
 
@@ -176,7 +233,7 @@ def _load_showtimes(conn: sqlite3.Connection) -> dict:
 
 def _movie_obj(m: sqlite3.Row, theater_id: str,
                details: dict, matches: dict, showtimes: dict,
-               eiga_reviews: dict, weights: dict) -> dict:
+               eiga_reviews: dict, weights: dict, score_trends: dict) -> dict:
     # 安全取列：老库可能没有 cast_names / eiga_rating 等后加的列。
     cols = m.keys()
     def g(key):
@@ -239,7 +296,7 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
         weights=weights,
     )
 
-    return {
+    obj = {
         "id": mid,
         "titleJp": g("title_jp") or "",
         "titleCn": title_cn,
@@ -265,11 +322,17 @@ def _movie_obj(m: sqlite3.Row, theater_id: str,
         "recommendScore": recommend_score,
         "sortScore": recommend_score,
     }
+    # 豆瓣分数变化趋势：只有真的变化过的电影才带这个字段（没变化/没历史 →
+    # 不输出，见 _score_trend_points），小程序据此判断要不要显示趋势图入口。
+    trend = score_trends.get(mid)
+    if trend:
+        obj["doubanScoreTrend"] = trend
+    return obj
 
 
 def build_district(conn: sqlite3.Connection, district: dict,
                    details: dict, matches: dict, showtimes: dict,
-                   eiga_reviews: dict, weights: dict) -> dict:
+                   eiga_reviews: dict, weights: dict, score_trends: dict) -> dict:
     # delete_flg=0: 論理削除された映画館は小程序に出さない。
     theaters_rows = conn.execute(
         "SELECT theater_id, name FROM theaters WHERE area = ? AND delete_flg = 0 "
@@ -286,7 +349,8 @@ def build_district(conn: sqlite3.Connection, district: dict,
         ).fetchall()
         if not movie_rows:
             continue  # 该影院当前无上映电影 → 不收录
-        movies = [_movie_obj(m, t["theater_id"], details, matches, showtimes, eiga_reviews, weights)
+        movies = [_movie_obj(m, t["theater_id"], details, matches, showtimes,
+                             eiga_reviews, weights, score_trends)
                   for m in movie_rows]
         # 今天(JST)在该影院没有场次的电影不输出（showtimes 已是当天一维数组）
         movies = [mv for mv in movies if mv["showtimes"]]
@@ -316,9 +380,11 @@ def build_all(config: Optional[dict] = None) -> dict:
         details, matches = _load_douban(conn)
         showtimes = _load_showtimes(conn)
         eiga_reviews = _load_eiga_reviews(conn)
+        score_trends = _load_douban_score_trends(conn)
         out = {}
         for d in DISTRICTS:
-            dj = build_district(conn, d, details, matches, showtimes, eiga_reviews, weights)
+            dj = build_district(conn, d, details, matches, showtimes,
+                                eiga_reviews, weights, score_trends)
             out[d["id"]] = dj
             logger.info("Step4 build: %s — %d theaters, %d movies",
                         d["id"], dj["theaterCount"],

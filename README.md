@@ -123,3 +123,15 @@ douban_url 为空 → 删除该电影的 match 记录，下次 step2 会重新�
 - 由于 VS 终端粘贴时可能会逐字符导致长命令被破坏，请优先将复杂命令写入脚本（.py 或 .ps1），再通过短命令执行，例如：
   - python _script.py
   - powershell ./_script.ps1
+
+## TIFF（東京国際映画祭）板块
+
+独立于 step1~4：数据进 `tiff_films` / `tiff_screenings` 两张新表，不碰 movies / douban_matches。详见 `pipeline/tiff.py`。
+
+1. 浏览器打开 https://2026.tiff-jp.net/ja/lineup/list.html ，滚到底全部加载后「另存为」HTML。
+2. `python run_tiff.py all <html>`：解析 HTML（作品 + 场次）→ 官网 API 补会场/结束时间/购票链接/英题/年份/国家 →
+   eiga 匹配（导演一致 / 同名 + 年份±1 校验）→ 豆瓣匹配（eiga 片在主库有豆瓣数据则复用）→ 导出并上传 `data/tiff.json`。
+3. 核对 / 修正：`python run_tiff.py report`，`set-eiga CODE ID|none`，`set-douban CODE ID|none`（修正后自动重新导出上传）。
+4. 排片有变动：重新另存 HTML 跑 `import` + `export`（匹配结果保留）；刷新豆瓣分：`douban --refresh` + `export`。
+
+⚠️ TIFF 表在本地 eiga.db 里；VM cron push 会覆盖云端整库。需要保留到云端时加 `--sync`（与 cron 错峰）。
