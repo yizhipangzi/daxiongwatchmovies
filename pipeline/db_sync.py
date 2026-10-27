@@ -318,6 +318,92 @@ def _restore_manual_data(db_path: Path, snap: dict) -> int:
     return restored
 
 
+# 只在本地维护、云端 VM 不碰的表（TIFF 板块，见 pipeline/tiff.py）。整库 pull 会用云端
+# （可能还没有这些表 / 是旧的）把它们冲掉——pull 前快照、pull 后整表回灌（本地优先）。
+# 本地这几张表为空时不回灌，沿用云端版本。
+_LOCAL_TABLES = ("tiff_films", "tiff_screenings")
+# TIFF 作品外链的主库行（eiga 信息在 movies，豆瓣在 douban_*，与 step1/step2 共用）。
+# 还没 push 到云端时 pull 也会冲掉——一并快照，pull 后 INSERT OR IGNORE 补回：
+# 云端已有的行（VM 更新过的）优先，不覆盖。
+_LINKED_TABLES = ("movies", "douban_matches", "douban_details", "douban_matches_history")
+
+
+def _snapshot_local_tables(db_path: Path) -> dict:
+    snap: dict = {}
+    if not Path(db_path).exists():
+        return snap
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            for t in _LOCAL_TABLES:
+                try:
+                    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                                       (t,)).fetchone()
+                    rows = [dict(r) for r in conn.execute(f"SELECT * FROM {t}")]
+                except Exception:
+                    continue  # 表不存在
+                if ddl and rows:
+                    snap[t] = {"ddl": ddl[0], "rows": rows}
+            ids = []
+            if "tiff_films" in snap:
+                ids = sorted({r.get("movie_id") or r.get("eiga_movie_id")
+                              for r in snap["tiff_films"]["rows"]} - {None, ""})
+            for t in _LINKED_TABLES if ids else ():
+                try:
+                    ph = ",".join("?" * len(ids))
+                    rows = [dict(r) for r in conn.execute(
+                        f"SELECT * FROM {t} WHERE movie_id IN ({ph})", ids)]
+                except Exception:
+                    continue
+                if rows:
+                    snap[f"linked:{t}"] = {"rows": rows}
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("pull_db: 快照本地表失败（忽略）: %s", exc)
+    return snap
+
+
+def _restore_local_tables(db_path: Path, snap: dict) -> int:
+    if not snap:
+        return 0
+    n = 0
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            for t, v in snap.items():
+                if t.startswith("linked:"):
+                    t = t[len("linked:"):]
+                    try:
+                        have = {r[1] for r in conn.execute(f"PRAGMA table_info({t})")}
+                    except Exception:
+                        continue
+                    cols = [c for c in v["rows"][0] if c in have]
+                    if not cols:
+                        continue
+                    cur = conn.executemany(
+                        f"INSERT OR IGNORE INTO {t} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                        [[r[c] for c in cols] for r in v["rows"]])
+                    n += max(cur.rowcount, 0)
+                    continue
+                conn.execute(v["ddl"].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+                conn.execute(f"DELETE FROM {t}")
+                cols = list(v["rows"][0])
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {t} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                    [[r[c] for c in cols] for r in v["rows"]])
+                n += len(v["rows"])
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("pull_db: 回灌本地表 %s 失败！请检查: %s", list(snap), exc)
+        return 0
+    logger.info("pull_db: 已保留本地 %s（%d 行）", "/".join(snap), n)
+    return n
+
+
 def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
     """从云存储下载 eiga.db 覆盖本地。云上还没有则返回 False（首次需先 init/push）。
 
@@ -373,6 +459,7 @@ def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     # 覆盖前快照本地人工干预数据，覆盖后回灌（见 _snapshot/_restore_manual_data）。
     manual_snap = _snapshot_manual_data(db_path)
+    local_snap = _snapshot_local_tables(db_path)
     # 先写临时文件再原子替换，避免写一半损坏。
     with tempfile.NamedTemporaryFile(dir=str(Path(db_path).parent), delete=False) as tf:
         tmp = Path(tf.name)
@@ -381,6 +468,7 @@ def pull_db(config: dict, db_path: Path = DB_PATH) -> bool:
     _clear_wal_siblings(db_path)  # 清掉旧 -wal/-shm，防止覆盖后不一致
     logger.info("pull_db: 云存储 → %s (%d bytes)", db_path, len(content))
     _restore_manual_data(db_path, manual_snap)
+    _restore_local_tables(db_path, local_snap)
     return True
 
 

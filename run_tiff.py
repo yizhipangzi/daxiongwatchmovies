@@ -12,8 +12,9 @@
   python run_tiff.py report                 # 匹配一览（人工核对）
   python run_tiff.py set-eiga   CODE EIGA_ID|none
   python run_tiff.py set-douban CODE DOUBAN_ID|none
+  python run_tiff.py restore-json [tiff.json]   # 应急：先 import，再从导出的 JSON 灌回匹配结果
 
-  --sync   开始前 pull eiga.db（本地 TIFF 表先快照、pull 后回灌）、结束后 push
+  --sync   开始前 pull eiga.db（本地 TIFF 数据自动保留）、结束后 push
            （与 VM cron 错峰！整库同步是「最后写的赢」）
 """
 import sys
@@ -44,7 +45,7 @@ def _load_config(path: str = "config.yaml") -> dict:
 def main():
     ap = argparse.ArgumentParser(description="TIFF 板块数据")
     ap.add_argument("cmd", choices=["all", "import", "eiga", "douban", "export", "report",
-                                    "set-eiga", "set-douban"])
+                                    "set-eiga", "set-douban", "restore-json"])
     ap.add_argument("args", nargs="*")
     ap.add_argument("--no-api", action="store_true", help="import 时不调官网 API（只用 HTML）")
     ap.add_argument("--all", action="store_true", help="eiga: 已匹配/已判定无的也重跑")
@@ -60,10 +61,7 @@ def main():
 
     if a.sync:
         from pipeline import db_sync
-        snap = tiff.snapshot_tables()
-        db_sync.pull_db(config)
-        n = tiff.restore_tables(snap)
-        logger.info("pull 后回灌本地 TIFF 数据 %d 行", n)
+        db_sync.pull_db(config)  # pull_db 自带保留本地 TIFF 表 + TIFF 挂着的 movies/豆瓣行
 
     if a.cmd in ("all", "import"):
         if not a.args:
@@ -82,6 +80,9 @@ def main():
         print(f"[OK] {r['file']} ver={r['ver']}")
         for k, v in r["file_ids"].items():
             print(f"  {k}: {v}")
+    if a.cmd == "restore-json":
+        # 应急：DB 被整库 pull 冲掉后，先 import 再从导出的 tiff.json 灌回匹配结果
+        print(tiff.restore_matches_from_json(Path(a.args[0] if a.args else f"{a.out}/tiff.json")))
     if a.cmd == "report":
         print(tiff.report())
 

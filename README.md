@@ -126,12 +126,19 @@ douban_url 为空 → 删除该电影的 match 记录，下次 step2 会重新�
 
 ## TIFF（東京国際映画祭）板块
 
-独立于 step1~4：数据进 `tiff_films` / `tiff_screenings` 两张新表，不碰 movies / douban_matches。详见 `pipeline/tiff.py`。
+作品/场次进 `tiff_films` / `tiff_screenings`；**eiga / 豆瓣匹配信息与日常 step1/step2 共用一处**：
+eiga 信息在 `movies`，豆瓣在 `douban_matches` / `douban_details` / `douban_matches_history`（按 movie_id）。
+`tiff_films.movie_id` 只外链 eiga.com 的 id；eiga 没登记但豆瓣有的片按 step1 惯例分配 `99999xxx` 临时 id
+（eiga 登记后用 `step2_api.py remap-id / merge-id` 换正式 id，tiff_films 会一起级联）。
+step2 已匹配过的片直接复用，不重复搜。详见 `pipeline/tiff.py`。
 
 1. 浏览器打开 https://2026.tiff-jp.net/ja/lineup/list.html ，滚到底全部加载后「另存为」HTML。
 2. `python run_tiff.py all <html>`：解析 HTML（作品 + 场次）→ 官网 API 补会场/结束时间/购票链接/英题/年份/国家 →
    eiga 匹配（导演一致 / 同名 + 年份±1 校验）→ 豆瓣匹配（eiga 片在主库有豆瓣数据则复用）→ 导出并上传 `data/tiff.json`。
 3. 核对 / 修正：`python run_tiff.py report`，`set-eiga CODE ID|none`，`set-douban CODE ID|none`（修正后自动重新导出上传）。
+   `set-douban` 走 step2 的 `manual_set_match`（manual=1），日常 step2 也不会再动它。
 4. 排片有变动：重新另存 HTML 跑 `import` + `export`（匹配结果保留）；刷新豆瓣分：`douban --refresh` + `export`。
 
-⚠️ TIFF 表在本地 eiga.db 里；VM cron push 会覆盖云端整库。需要保留到云端时加 `--sync`（与 cron 错峰）。
+⚠️ 整库 pull 时，`pull_db` 会自动保留本地 TIFF 表和 TIFF 挂着的 movies / 豆瓣行（云端已有的行优先，
+manual=1 的人工匹配本地优先）。要把 TIFF 数据也存进云端主库：`python run_tiff.py export --sync`（与 VM cron 错峰）。
+应急：TIFF 表被冲空时 `python run_tiff.py restore-json [tiff.json]` 从导出的 JSON 重建。

@@ -1349,7 +1349,7 @@ def remap_unlisted_id(old_id: str, new_id: str, delay: float = 0.5) -> dict:
     # Re-parent all child tables (SQLite FKs are advisory; update manually).
     for table in ("screenings", "showtimes", "movie_snapshots",
                   "douban_matches", "douban_details", "douban_matches_history",
-                  "douban_skip_list", "eiga_reviews"):
+                  "douban_skip_list", "eiga_reviews", "tiff_films"):
         try:
             conn.execute(f"UPDATE {table} SET movie_id=? WHERE movie_id=?", (new_id, old_id))
         except Exception:
@@ -1419,6 +1419,7 @@ def merge_movie_ids(old_id: str, new_id: str) -> dict:
         "showtimes": ["theater_id", "show_date", "start_time"],
         "eiga_reviews": ["position"],
         "douban_matches_history": ["snapshot_at"],
+        "tiff_films": ["film_code"],  # TIFF 板块外链 movie_id（pipeline/tiff.py）
     }
     moved = {}
     for table, pk_rest in _CHILD_PKS.items():
