@@ -530,6 +530,38 @@ def _in_scope_movie_ids(conn: sqlite3.Connection) -> set:
     return {r["movie_id"] for r in rows}
 
 
+# 「最近两年内的作品」：制作年份 > 今年 - 2（2026 年即 2025、2026 年的片）。
+SCORE_RECENT_YEARS = 2
+
+
+def score_scope_movie_ids(conn: sqlite3.Connection) -> set:
+    """每日刷新分数（豆瓣 / eiga.com）的对象：今天（JST）有排片 + 最近两年内的作品。
+
+    比 _in_scope_movie_ids 更窄：只认 show_date == 今天（不含今后几天才有的场次），
+    且 movies.year 在 SCORE_RECENT_YEARS 年内。year 为空（未登録片等）无法判断，不算。
+    老片 / 今天没场次的片不再每天刷分，保留最后一次的分数。
+    """
+    from datetime import timezone
+    JST = timezone(timedelta(hours=9))
+    now_jst = datetime.now(JST)
+    today = now_jst.date().isoformat()
+    min_year = now_jst.year - SCORE_RECENT_YEARS + 1
+
+    from pipeline.step4_export import DISTRICTS as _DISTRICTS
+    district_names = tuple(d["name"] for d in _DISTRICTS)
+    area_ph = ",".join("?" for _ in district_names) or "''"
+    rows = conn.execute(
+        f"""SELECT DISTINCT s.movie_id FROM showtimes s
+             JOIN theaters t ON t.theater_id = s.theater_id
+             JOIN movies mv ON mv.movie_id = s.movie_id
+            WHERE t.area IN ({area_ph}) AND t.delete_flg = 0
+              AND s.show_date = ?
+              AND mv.year >= ?""",
+        district_names + (today, min_year),
+    ).fetchall()
+    return {r["movie_id"] for r in rows}
+
+
 def _refresh_imdb_score(conn: sqlite3.Connection, mid: str, imdb_id: str, now: str) -> None:
     """Fetch today's IMDb rating for one movie via OMDb, once per day.
 
@@ -629,6 +661,9 @@ def match_movies(categories: tuple = ("chain", "indie"),
     # Once a film stops screening, matching/score-refresh simply stops touching
     # it; its last known Douban/IMDb scores stand as-is.
     scope_ids = _in_scope_movie_ids(conn)
+    # 已匹配片的每日刷分只针对「今天有排片 + 最近两年内」的（见 score_scope_movie_ids）；
+    # 新片的匹配仍按上面的 scope_ids。
+    score_ids = score_scope_movie_ids(conn)
     movies = conn.execute(
         "SELECT * FROM movies WHERE category IN ({}) ORDER BY category, rank".format(
             ",".join("?" for _ in categories)),
@@ -642,6 +677,7 @@ def match_movies(categories: tuple = ("chain", "indie"),
     score_tracker = _FetchRetryTracker(label="Score refresh")
     _search_count = 0  # counts new-movie searches (not score refreshes)
     _skipped_refreshed_today = 0  # verified matches whose score was already refreshed today
+    _skipped_out_of_scope = 0  # verified matches not screening today / older than 2 years
 
     for i, mov in enumerate(movies, 1):
         mid = mov["movie_id"]
@@ -659,7 +695,9 @@ def match_movies(categories: tuple = ("chain", "indie"),
                 # row gets written — see _history_unchanged below): a failed fetch
                 # doesn't stamp it, so it retries automatically on the next run.
                 refreshed_today = existing["score_checked_at"] == today_str
-                if refreshed_today:
+                if mid not in score_ids:
+                    _skipped_out_of_scope += 1
+                elif refreshed_today:
                     _skipped_refreshed_today += 1
                 elif score_tracker.should_continue():
                     logger.info("[%d/%d] %s | %s — refreshing score",
@@ -874,6 +912,9 @@ def match_movies(categories: tuple = ("chain", "indie"),
     if _skipped_refreshed_today:
         logger.info("Score refresh: skipped %d movie(s) already refreshed today",
                     _skipped_refreshed_today)
+    if _skipped_out_of_scope:
+        logger.info("Score refresh: skipped %d movie(s) not screening today or older than %d years",
+                    _skipped_out_of_scope, SCORE_RECENT_YEARS)
     logger.info("=== Douban matching complete: %d/%d matched ===", matched, len(movies))
     return results
 

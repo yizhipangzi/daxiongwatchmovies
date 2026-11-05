@@ -131,8 +131,10 @@ def _get_db() -> sqlite3.Connection:
     # director (監督) column already exists above.
     # poster_url = 海报图 URL（从电影海报页 /movie/{id}/photo/ 的 .movie-photo img
     # 抽取并升到高清 /640.jpg）。eiga 没有海报时留空，由 step4 回退到豆瓣海报。
+    # eiga_checked_at = 最后一次抓详情页取评分的 JST 日期，防止同一天重复刷分。
     for col_def in ("eiga_rating REAL", "eiga_rating_count INTEGER",
-                    "script TEXT", "cast_names TEXT", "poster_url TEXT"):
+                    "script TEXT", "cast_names TEXT", "poster_url TEXT",
+                    "eiga_checked_at TEXT"):
         try:
             conn.execute(f"ALTER TABLE movies ADD COLUMN {col_def}")
         except Exception:
@@ -647,6 +649,55 @@ def _ensure_movie_detail(conn: sqlite3.Connection, movie_id: str, title_jp: str,
              mov.get("poster_url"),
              movie_id),
         )
+    if not reuse and mov.get("eiga_rating") is not None:
+        # 刚抓过详情页 = 今天的评分已拿到，refresh_eiga_ratings 不再重抓。
+        from datetime import datetime, timezone, timedelta
+        JST = timezone(timedelta(hours=9))
+        conn.execute("UPDATE movies SET eiga_checked_at=? WHERE movie_id=?",
+                     (datetime.now(JST).date().isoformat(), movie_id))
+
+
+def refresh_eiga_ratings(conn: sqlite3.Connection, delay: float = 0.5) -> int:
+    """每天刷新 eiga.com 评分（eiga_rating / eiga_rating_count）。
+
+    对象与豆瓣刷分同一口径：今天有排片 + 最近两年内的作品（score_scope_movie_ids）。
+    其余电影保留最后一次的评分不再抓。eiga_checked_at 记录当天已抓，抓取失败不打戳，
+    下次运行自动重试。返回本次更新的电影数。
+    """
+    from datetime import datetime, timezone, timedelta
+    from pipeline.step2_douban import score_scope_movie_ids
+    from scraper import fetcher
+
+    JST = timezone(timedelta(hours=9))
+    today = datetime.now(JST).date().isoformat()
+    scope = score_scope_movie_ids(conn)
+    rows = [r for r in conn.execute(
+        "SELECT movie_id, title_jp, eiga_checked_at FROM movies "
+        "WHERE movie_id NOT LIKE '99999%'"
+    ).fetchall() if r["movie_id"] in scope and r["eiga_checked_at"] != today]
+    logger.info("eiga 刷分：%d 部（今天有排片 + 最近两年内，今天未刷）", len(rows))
+
+    updated = 0
+    for r in rows:
+        if fetcher.exhausted():
+            logger.warning("eiga 刷分：抓取冷却用尽，提前停止（已刷 %d/%d，下次续跑）",
+                           updated, len(rows))
+            break
+        detail = _scrape_movie_detail(r["movie_id"], delay=delay)
+        if detail.get("eiga_rating") is None:
+            continue
+        conn.execute(
+            """UPDATE movies SET eiga_rating=?,
+                   eiga_rating_count=COALESCE(?, eiga_rating_count),
+                   eiga_checked_at=?
+                 WHERE movie_id=?""",
+            (detail["eiga_rating"], detail.get("eiga_rating_count"), today, r["movie_id"]),
+        )
+        conn.commit()
+        updated += 1
+        logger.info("[eiga 刷分 %d/%d] %s | %.1f (%s件)", updated, len(rows), r["title_jp"],
+                    detail["eiga_rating"], detail.get("eiga_rating_count"))
+    return updated
 
 
 _TIME_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})")
@@ -1091,6 +1142,10 @@ def scrape_movies(delay: float = 0.5, scrape_showtimes: bool = True) -> dict:
         results[category].append(m)
 
     conn.commit()
+    try:
+        refresh_eiga_ratings(conn, delay=delay)
+    except Exception as exc:
+        logger.warning("eiga 刷分失败: %s", exc)
     conn.close()
 
     for cat in ("chain", "indie"):
